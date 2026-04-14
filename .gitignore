@@ -8,3 +8,5 @@ dist/
 !hooks/*.js
 .DS_Store
 *.tsbuildinfo
+*.bun-build
+.claude/
