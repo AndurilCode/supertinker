@@ -10,7 +10,7 @@
 
 ## Overview
 
-supertinker lets you define **directed acyclic graphs (DAGs)** of AI agent calls. Each node invokes an agent — Claude Code, GitHub Copilot, or any custom provider — captures its output into a shared context, and follows an edge determined by the agent's own output choice. The engine ships as a single ~1 100-line TypeScript file with no npm runtime dependencies.
+supertinker lets you define **directed acyclic graphs (DAGs)** of AI agent calls. Each node invokes an agent — Claude Code, GitHub Copilot, or any custom provider — captures its output into a shared context, and follows an edge determined by the agent's own output choice. The engine ships as a single TypeScript file with no npm runtime dependencies. Extensions are plugins: providers, hooks, storage adapters, and workflows — the core stays thin.
 
 **Why supertinker?**
 
@@ -30,7 +30,8 @@ Most orchestration frameworks require a server, a database, or a runtime you don
 | **Pause & resume** | Any node can pause execution for a human decision; resume with a choice label |
 | **Guardrails** | Pre- and post-execution checks (JS expressions or TypeScript functions); failures retry once, then pause |
 | **Iteration limits** | `maxIterations` prevents infinite review loops |
-| **Hook system** | 12 lifecycle events; hooks can observe, mutate context, skip / redirect / pause / abort |
+| **Storage adapter** | Pluggable persistence layer — swap filesystem for DB, S3, or custom backends |
+| **Hook system** | 13 lifecycle events; hooks can observe, mutate context, skip / redirect / pause / abort |
 | **Context threading** | Each node's output is stored as `context[nodeId]`; downstream nodes reference it via `[nodeId]` in instructions |
 | **Context slicing** | Nodes declare a `slice` list to limit what context the agent sees, reducing token use |
 | **Built-in logger** | Structured log to `<runDir>/orchestrator.log` and stdout for every lifecycle event |
@@ -43,7 +44,7 @@ Most orchestration frameworks require a server, a database, or a runtime you don
 
 ```
 supertinker/
-├── supertinker.ts              # Core engine + CLI (~1 100 lines)
+├── supertinker.ts              # Core engine + CLI
 ├── providers/
 │   ├── claude.ts               # Claude Code CLI provider
 │   └── copilot.ts              # GitHub Copilot CLI provider
@@ -55,14 +56,26 @@ supertinker/
     └── workflow.ts             # Example: plan → develop → review loop
 ```
 
-User extensions live in `~/.supertinker/`:
+### Plugin search order
+
+Plugins are discovered in three locations, **project-local first**:
 
 ```
-~/.supertinker/
-├── providers/      # Custom provider modules (*.ts or *.js)
-├── hooks/          # Custom hook modules (*.ts or *.js)
-└── workflows/      # Saved or custom workflow modules (*.workflow.ts or *.ts)
+.supertinker/          ← per-project (highest priority)
+~/.supertinker/        ← per-user
+<install-dir>/         ← built-in (lowest priority)
 ```
+
+Each location can contain:
+
+```
+├── providers/      # Provider modules (*.ts or *.js)
+├── hooks/          # Hook modules (*.ts or *.js)
+├── workflows/      # Workflow modules (*.workflow.ts)
+└── storage/        # Storage adapter (storage.ts or storage.js)
+```
+
+Providers and workflows **override** by name (first match wins). Hooks **merge** (all hooks from all locations run together). Storage adapters merge (custom methods override defaults, unset methods fall back to filesystem).
 
 ---
 
@@ -121,16 +134,15 @@ tsx supertinker.ts list --hooks   # list loaded hooks and their subscribed event
 
 ## Execution model
 
-1. `run()` creates a run directory at `/tmp/orchestrator/<workflowId>-<timestamp>/`.
-2. Hooks are discovered from `hooks/` (built-in) and `~/.supertinker/hooks/` (user).
+1. `run()` loads the storage adapter and creates a run directory (default: `/tmp/orchestrator/<workflowId>-<timestamp>/`).
+2. Hooks are discovered from all three search paths (project, user, built-in).
 3. A tmux window is opened to tail `orchestrator.log` (when in a tmux session).
 4. The graph starts at `graph.start`. For each standard node:
-   - Context is sliced if `slice` is defined.
-   - A user prompt is rendered from context + node instruction.
-   - A `---CHOICE---` sentinel is appended to the system prompt so the agent must output a valid label.
-   - The provider CLI is spawned and JSON output is captured.
-   - Post-guardrail checks run; on failure the agent retries once, then the run pauses.
-   - The `PostAgent` hook fires; hooks can redirect, skip, or abort.
+   - Pre-guardrails run; `PreAgent` hook fires (can skip, redirect, pause, or abort).
+   - Context is sliced, prompts are rendered.
+   - `PreProvider` hook fires (can intercept before CLI spawn — useful for logging, rate limiting, dry-run).
+   - The provider CLI is spawned and output is captured.
+   - `PostAgent` hook fires; post-guardrail checks run (retry once on failure, then pause).
    - The graph follows the edge matching the agent's chosen label.
 5. Fork nodes fan out to branches concurrently; join nodes block until all listed branches complete.
 6. Subworkflow nodes parse a JSON workflow from context, write it to disk, and execute it as a nested `run()`.
@@ -146,13 +158,13 @@ tsx supertinker.ts list --hooks   # list loaded hooks and their subscribed event
   ──────────────────────▶│  run() / resume() / list()   │
                          └──────────────┬──────────────┘
                                         │ loads
-                    ┌───────────────────┼────────────────────┐
-                    ▼                   ▼                    ▼
-             Workflow (DAG)         Hook index           Provider registry
-             ─────────────         ──────────           ─────────────────
-             GraphNode[]           12 events            claude.ts
-             AgentRegistry         priority order       copilot.ts
-             Guardrails            parallel / serial    ~/.supertinker/providers/
+               ┌────────────────────┬───┼────────────────────┐
+               ▼                    ▼   ▼                    ▼
+        Storage adapter      Workflow  Hook index       Provider registry
+        ───────────────      ────────  ──────────       ─────────────────
+        filesystem (default) DAG       13 events        claude.ts
+        DB / S3 / custom     Guardrails priority order  copilot.ts
+                                       parallel/serial  custom providers
 
                                         │
                                         ▼
@@ -277,7 +289,7 @@ guardrails: {
 }
 ```
 
-Variables available in rule expressions: `output`, `choice`, `nodeId`, `context`.
+Variables available in rule expressions: `output`, `choice`, `nodeId`, `context`, `require` (CJS require for filesystem checks).
 
 Guardrail checks can also be TypeScript functions (`GuardrailCheck`) for logic that JS expressions cannot express cleanly — see `examples/workflow.ts`.
 
@@ -313,16 +325,18 @@ export const hook: Hook = {
 | Directive | Supported on |
 |---|---|
 | `{ action: "continue" }` | All events |
-| `{ action: "skip" }` | `PreAgent` |
-| `{ action: "pause", reason }` | `PreAgent`, `PostAgent`, `GuardrailFail`, `SubworkflowStart` |
-| `{ action: "redirect", targetNodeId }` | `PreAgent`, `PostAgent` |
+| `{ action: "skip" }` | `PreAgent`, `PreProvider` |
+| `{ action: "pause", reason }` | `PreAgent`, `PreProvider`, `PostAgent`, `GuardrailFail`, `SubworkflowStart` |
+| `{ action: "redirect", targetNodeId }` | `PreAgent`, `PreProvider`, `PostAgent` |
 | `{ action: "abort", reason }` | All events |
 
 When multiple hooks fire for the same event, the highest-rank directive wins: `abort > pause > redirect > skip > continue`.
 
 ### Lifecycle events
 
-`RunStart` · `RunEnd` · `PreAgent` · `PostAgent` · `Paused` · `Resumed` · `ForkStart` · `ForkJoin` · `GuardrailFail` · `SubworkflowStart` · `SubworkflowEnd` · `Error`
+`RunStart` · `RunEnd` · `PreAgent` · `PreProvider` · `PostAgent` · `Paused` · `Resumed` · `ForkStart` · `ForkJoin` · `GuardrailFail` · `SubworkflowStart` · `SubworkflowEnd` · `Error`
+
+All agent-related events (`PreAgent`, `PreProvider`, `PostAgent`) include a `provider` field with the CLI command name (e.g. `"claude"`, `"copilot"`).
 
 ---
 
@@ -347,12 +361,47 @@ Providers are loaded lazily by name from the registry's `command` field. For exa
 
 ---
 
+## Writing a storage adapter
+
+Place a `storage.ts` (or `.js`) file in `.supertinker/storage/` or `~/.supertinker/storage/`. Export a partial `StorageAdapter` object — only override the methods you need:
+
+```typescript
+import { mkdirSync, writeFileSync } from "fs"
+import { join } from "path"
+import type { StorageAdapter } from "../../supertinker.js"
+
+export const storage: Partial<StorageAdapter> = {
+  async saveWorkflow(id, content) {
+    const dir = join(process.cwd(), ".supertinker", "workflows")
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, `${id}.workflow.ts`), content)
+  },
+}
+```
+
+### StorageAdapter methods
+
+| Method | Default behavior |
+|---|---|
+| `createRun(runId)` | Creates `/tmp/orchestrator/<runId>/` |
+| `saveContext(runDir, context)` | Writes `context.json` |
+| `loadContext(runDir)` | Reads `context.json` |
+| `savePause(runDir, state)` | Writes `state.json` |
+| `loadPause(runDir)` | Reads `state.json` |
+| `pauseExists(runDir)` | Checks `state.json` exists |
+| `appendLog(runDir, line)` | Appends to `orchestrator.log` |
+| `saveFile(runDir, name, content)` | Writes file to run directory |
+| `saveWorkflow(id, content)` | Saves to `~/.supertinker/workflows/` |
+| `logPath(runDir, nodeId)` | Returns `<runDir>/<nodeId>.log` |
+
+---
+
 ## Meta-workflow
 
 The built-in `meta` workflow (`workflows/meta.workflow.ts`) is the recommended entry point for open-ended tasks. It runs in two stages:
 
-1. **`design` node** — An architect agent reads a workflow catalog and designs (or reuses) a `Workflow` JSON object tailored to the task. Post-guardrails verify the output is valid `Workflow` JSON before proceeding.
-2. **`execute` node** — A `subworkflow` node parses the JSON, materialises it to disk, and executes it as a nested run.
+1. **`design` node** — An architect agent reads a workflow catalog, inspects the working directory for existing artifacts, and designs (or reuses) a `Workflow` JSON object tailored to the task. Post-guardrails verify the output is valid `Workflow` JSON before proceeding.
+2. **`execute` node** — A `subworkflow` node parses the JSON, materialises it to disk, saves it to the workflow library (via the storage adapter), and executes it as a nested run.
 
 `maxIterations: 3` on the design node prevents infinite retry loops if the architect produces malformed JSON.
 
@@ -408,13 +457,13 @@ If you run supertinker inside a Claude Code session, add these permissions so Cl
 
 ## Contributing
 
-Contributions are welcome. The entire engine is in a single file (`supertinker.ts`), which makes it straightforward to read end-to-end before making changes.
+Contributions are welcome. The core engine lives in a single file (`supertinker.ts`) — read it end-to-end before making changes. **New features should be implemented as plugins (providers, hooks, storage adapters, workflows), not by expanding the core.**
 
 **Areas open for contribution:**
-- Additional built-in providers (Gemini CLI, OpenAI CLI, local models via `ollama`)
-- Additional built-in workflows (test-driven development, documentation generation, security review)
-- Additional hook examples (Slack notifications, cost tracking, audit logging)
-- Improved error messages and pause-state introspection
+- Additional providers (Gemini CLI, OpenAI CLI, local models via `ollama`)
+- Additional workflows (test-driven development, documentation generation, security review)
+- Additional hooks (Slack notifications, cost tracking, audit logging, rate limiting)
+- Custom storage adapters (database-backed, S3, distributed)
 
 Please open an issue before submitting a large pull request so the approach can be discussed first.
 
