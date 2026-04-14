@@ -68,17 +68,64 @@ export interface PausedState {
   runId: string; nodeId: string; context: Context; agentOutput: string; reason?: string
 }
 
+// ─── STORAGE ADAPTER
+
+export interface StorageAdapter {
+  createRun(runId: string): Promise<string>               // returns runDir (or equivalent path)
+  saveContext(runDir: string, context: Context): Promise<void>
+  loadContext(runDir: string): Promise<Context>
+  savePause(runDir: string, state: PausedState): Promise<void>
+  loadPause(runDir: string): Promise<PausedState>
+  pauseExists(runDir: string): Promise<boolean>
+  appendLog(runDir: string, line: string): Promise<void>
+  saveFile(runDir: string, name: string, content: string): Promise<void>
+  logPath(runDir: string, nodeId: string): string          // returns path for provider logFile
+}
+
+export const filesystemStorage: StorageAdapter = {
+  async createRun(runId) {
+    const dir = join("/tmp/orchestrator", runId)
+    mkdirSync(dir, { recursive: true })
+    return dir
+  },
+  async saveContext(runDir, context) {
+    writeFileSync(join(runDir, "context.json"), JSON.stringify(context, null, 2))
+  },
+  async loadContext(runDir) {
+    return JSON.parse(readFileSync(join(runDir, "context.json"), "utf8"))
+  },
+  async savePause(runDir, state) {
+    writeFileSync(join(runDir, "state.json"), JSON.stringify(state, null, 2))
+  },
+  async loadPause(runDir) {
+    return JSON.parse(readFileSync(join(runDir, "state.json"), "utf8"))
+  },
+  async pauseExists(runDir) {
+    return existsSync(join(runDir, "state.json"))
+  },
+  async appendLog(runDir, line) {
+    appendFileSync(join(runDir, "orchestrator.log"), line + "\n")
+  },
+  logPath(runDir, nodeId) {
+    return join(runDir, `${nodeId}.log`)
+  },
+  async saveFile(runDir, name, content) {
+    writeFileSync(join(runDir, name), content)
+  },
+}
+
 interface RunState {
   runId: string; runDir: string; context: Context
   joinMap: Map<string, Set<string>>; iterationCounts: Map<string, number>
   graph: Graph; registry: AgentRegistry; guardrails: Guardrails; hooks: HookIndex
+  storage: StorageAdapter
 }
 
 // ─── HOOKS
 
 export type HookEventName =
   | "RunStart" | "RunEnd"
-  | "PreAgent" | "PostAgent"
+  | "PreAgent" | "PostAgent" | "PreProvider"
   | "Paused"   | "Resumed"
   | "ForkStart" | "ForkJoin"
   | "GuardrailFail"
@@ -98,6 +145,7 @@ interface HookEventMap {
   RunEnd:           { terminal: "done" | "failed"; finalContext: Context }
   PreAgent:         { nodeId: string; agent: string; userPrompt: string; systemPrompt: string; slicedContext: Context }
   PostAgent:        { nodeId: string; agent: string; result: AgentResult; transcriptPath?: string }
+  PreProvider:      { nodeId: string; agent: string; provider: string; userPrompt: string; systemPrompt: string; cwd: string; model?: string }
   Paused:           { nodeId: string; reason?: string; stateFile: string }
   Resumed:          { nodeId: string; choice: string }
   ForkStart:        { nodeId: string; targets: string[] }
@@ -175,8 +223,9 @@ function resolveFallback(node: GraphNode, graph: Graph): string {
   return node.fallback ?? graph.fallback
 }
 
-function saveContext(runDir: string, context: Context): void {
-  writeFileSync(join(runDir, "context.json"), JSON.stringify(context, null, 2))
+// saveContext/savePause delegate to state.storage when available, fall back to filesystem
+async function saveContext(state: RunState): Promise<void> {
+  await state.storage.saveContext(state.runDir, state.context)
 }
 
 // ─── SYSTEM PROMPT
@@ -224,10 +273,19 @@ async function loadProvider(name: string): Promise<ProviderInvoke> {
   return invoke
 }
 
+async function loadStorage(): Promise<StorageAdapter> {
+  const path = findFile("storage", "storage", "ts|js")
+  if (!path) return filesystemStorage
+  const mod = await import(path)
+  const adapter = mod.storage ?? mod.default?.storage
+  if (!adapter) return filesystemStorage
+  return { ...filesystemStorage, ...adapter }  // merge: custom overrides only what it defines
+}
+
 // ─── HOOK SYSTEM
 
 const VALID_EVENTS = new Set<HookEventName>([
-  "RunStart", "RunEnd", "PreAgent", "PostAgent", "Paused", "Resumed",
+  "RunStart", "RunEnd", "PreAgent", "PostAgent", "PreProvider", "Paused", "Resumed",
   "ForkStart", "ForkJoin", "GuardrailFail", "SubworkflowStart", "SubworkflowEnd", "Error",
 ])
 
@@ -237,9 +295,9 @@ const DIRECTIVE_RANK: Record<string, number> = {
 
 const DIRECTIVE_SUPPORT: Record<string, Set<HookEventName>> = {
   abort:    new Set(VALID_EVENTS),
-  pause:    new Set(["PreAgent", "PostAgent", "GuardrailFail", "SubworkflowStart"]),
-  redirect: new Set(["PreAgent", "PostAgent"]),
-  skip:     new Set(["PreAgent"]),
+  pause:    new Set(["PreAgent", "PreProvider", "PostAgent", "GuardrailFail", "SubworkflowStart"]),
+  redirect: new Set(["PreAgent", "PreProvider", "PostAgent"]),
+  skip:     new Set(["PreAgent", "PreProvider"]),
   continue: new Set(VALID_EVENTS),
 }
 
@@ -383,7 +441,7 @@ async function invokeAgent(
   const userPrompt = precomputed?.userPrompt  ?? renderUserPrompt(sliceContext(state.context, node.slice), node.instruction)
   const sysPrompt  = precomputed?.systemPrompt ?? buildSystemPrompt(state.registry, node)
   const cwd        = resolve(node.cwd ?? process.cwd())
-  const logFile    = join(state.runDir, `${node.id}.log`)
+  const logFile    = state.storage.logPath(state.runDir, node.id)
 
   tmux("new-window", `node-${node.id}`, `tail -f ${logFile}`)
   try {
@@ -439,14 +497,13 @@ async function applyDirective(
 }
 
 async function writePause(state: RunState, nodeId: string, fromNodeId: string | null, reason?: string): Promise<void> {
-  const { runDir, context } = state
-  const stateFile = join(runDir, "state.json")
   const paused: PausedState = {
-    runId: state.runId, nodeId: fromNodeId ?? nodeId, context,
-    agentOutput: context[fromNodeId ?? ""] ?? "", reason,
+    runId: state.runId, nodeId: fromNodeId ?? nodeId, context: state.context,
+    agentOutput: state.context[fromNodeId ?? ""] ?? "", reason,
   }
-  writeFileSync(stateFile, JSON.stringify(paused, null, 2))
-  saveContext(runDir, context)
+  await state.storage.savePause(state.runDir, paused)
+  await saveContext(state)
+  const stateFile = join(state.runDir, "state.json")
   await emitHook("Paused", { nodeId, reason, stateFile }, state)
 }
 
@@ -490,12 +547,11 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
 
     const importPath = resolve("supertinker.ts").replace(/\.ts$/, "")
     const tsContent = `import type { Workflow } from "${importPath}";\n\nexport const workflow: Workflow = ${JSON.stringify(inner, null, 2)};\n`
-    const workflowFile = join(runDir, `${inner.id}.workflow.ts`)
-    writeFileSync(workflowFile, tsContent)
+    const workflowFile = `${inner.id}.workflow.ts`
+    await state.storage.saveFile(runDir, workflowFile, tsContent)
     await emitHook("SubworkflowStart", { nodeId, innerWorkflow: inner }, state)
 
-    const innerRunDir = join(runDir, `sub-${inner.id}`)
-    mkdirSync(innerRunDir, { recursive: true })
+    const innerRunDir = await state.storage.createRun(`${state.runId}/sub-${inner.id}`)
 
     const innerContext: Context = {}
     for (const key of node.slice ?? Object.keys(context))
@@ -516,16 +572,17 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
         post: [...(state.guardrails.post ?? []), ...(inner.guardrails?.post ?? [])],
       },
       hooks: state.hooks,
+      storage: state.storage,
     }
 
     try { await executeNode(inner.graph.start, null, innerState) }
     catch (err) { return errorFallback(state, nodeId, node, String(err)) }
 
     context[nodeId] = JSON.stringify(innerState.context)
-    saveContext(runDir, context)
+    await saveContext(state)
 
     const libDir = join(USER_DIR, "workflows"); mkdirSync(libDir, { recursive: true })
-    copyFileSync(workflowFile, join(libDir, `${inner.id}.workflow.ts`))
+    copyFileSync(join(runDir, workflowFile), join(libDir, `${inner.id}.workflow.ts`))
     await emitHook("SubworkflowEnd", { nodeId, innerContext: innerState.context }, state)
 
     const next = node.options?.["done"]
@@ -561,6 +618,13 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
 
   if (await applyDirective(preDirective, state, nodeId, node, fromNodeId)) return
 
+  const def = state.registry[node.agent!]
+  const preProviderDirective = await emitHook("PreProvider", {
+    nodeId, agent: node.agent!, provider: def.command,
+    userPrompt, systemPrompt: sysPrompt, cwd: resolve(node.cwd ?? process.cwd()), model: def.model,
+  }, state)
+  if (await applyDirective(preProviderDirective, state, nodeId, node, fromNodeId)) return
+
   let result: AgentResult
   try { result = await invokeAgent(node, state, { userPrompt, systemPrompt: sysPrompt }) }
   catch (err) { return errorFallback(state, nodeId, node, String(err)) }
@@ -593,7 +657,7 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
   if (!nextNodeId) return errorFallback(state, nodeId, node, `choice "${result.choice}" not declared`)
 
   context[nodeId] = result.output
-  saveContext(runDir, context)
+  await saveContext(state)
   return executeNode(nextNodeId, nodeId, state)
 }
 
@@ -635,9 +699,9 @@ export function resolveWorkflow(name: string): string | null {
 
 export async function run({ workflow, initialContext = {} }: { workflow: Workflow; initialContext?: Context }): Promise<void> {
   const { graph, registry } = workflow
+  const storage = await loadStorage()
   const runId  = `${workflow.id}-${Date.now()}`
-  const runDir = join("/tmp/orchestrator", runId)
-  mkdirSync(runDir, { recursive: true })
+  const runDir = await storage.createRun(runId)
 
   const hooks = await loadHooks(runDir)
 
@@ -645,7 +709,7 @@ export async function run({ workflow, initialContext = {} }: { workflow: Workflo
 
   const state: RunState = {
     runId, runDir, context: { ...initialContext }, joinMap: new Map(),
-    iterationCounts: new Map(), graph, registry, guardrails: workflow.guardrails ?? {}, hooks,
+    iterationCounts: new Map(), graph, registry, guardrails: workflow.guardrails ?? {}, hooks, storage,
   }
 
   await emitHook("RunStart", { workflow, initialContext }, state)
@@ -657,17 +721,18 @@ export async function run({ workflow, initialContext = {} }: { workflow: Workflo
 
 export async function resume({ workflow, runId, choice }: { workflow: Workflow; runId: string; choice: string }): Promise<void> {
   const { graph, registry } = workflow
+  const storage = await loadStorage()
   const runDir = join("/tmp/orchestrator", runId)
-  if (!existsSync(join(runDir, "state.json"))) throw new Error(`No paused state: ${runDir}/state.json`)
+  if (!await storage.pauseExists(runDir)) throw new Error(`No paused state for run: ${runId}`)
 
-  const paused: PausedState = JSON.parse(readFileSync(join(runDir, "state.json"), "utf8"))
+  const paused = await storage.loadPause(runDir)
   const hooks = await loadHooks(runDir)
   const fromNode = graph.nodes.find(n => n.id === paused.nodeId)
   if (!fromNode?.options?.[choice]) throw new Error(`Choice "${choice}" not valid for "${paused.nodeId}". Options: ${Object.keys(fromNode?.options ?? {})}`)
 
   const state: RunState = {
     runId, runDir, context: paused.context, joinMap: new Map(),
-    iterationCounts: new Map(), graph, registry, guardrails: workflow.guardrails ?? {}, hooks,
+    iterationCounts: new Map(), graph, registry, guardrails: workflow.guardrails ?? {}, hooks, storage,
   }
 
   await emitHook("Resumed", { nodeId: paused.nodeId, choice }, state)

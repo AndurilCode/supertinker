@@ -17,7 +17,7 @@ export const hook: Hook = {
   name: "logger",
   description: "Built-in structured logging for all orchestrator events",
   events: [
-    "RunStart", "RunEnd", "PreAgent", "PostAgent", "Paused", "Resumed",
+    "RunStart", "RunEnd", "PreAgent", "PreProvider", "PostAgent", "Paused", "Resumed",
     "ForkStart", "ForkJoin", "GuardrailFail", "SubworkflowStart", "SubworkflowEnd", "Error",
   ],
   parallel: true,
@@ -40,6 +40,11 @@ export const hook: Hook = {
       case "PreAgent": {
         const e = event as Extract<HookEvent, { event: "PreAgent" }>
         write(event, "START", e.nodeId, `agent: ${e.agent}`)
+        break
+      }
+      case "PreProvider": {
+        const e = event as Extract<HookEvent, { event: "PreProvider" }>
+        write(event, "INVOKE", e.nodeId, `provider: ${e.provider}${e.model ? ` model: ${e.model}` : ""}`)
         break
       }
       case "PostAgent": {
