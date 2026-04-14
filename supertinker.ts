@@ -199,10 +199,12 @@ export type ProviderInvoke = (ctx: ProviderContext) => Promise<AgentResult>
 
 const BUILTIN_DIR = resolve(join(new URL(import.meta.url).pathname, ".."))
 const USER_DIR    = join(homedir(), ".supertinker")
+const PROJECT_DIR = join(process.cwd(), ".supertinker")
+const SEARCH_DIRS = [PROJECT_DIR, USER_DIR, BUILTIN_DIR]  // project-local wins
 const providerCache = new Map<string, ProviderInvoke>()
 
 function findFile(name: string, subdir: string, ext: string): string | null {
-  for (const base of [BUILTIN_DIR, USER_DIR]) {
+  for (const base of SEARCH_DIRS) {
     for (const e of ext.split("|")) {
       const p = join(base, subdir, `${name}.${e}`)
       if (existsSync(p)) return p
@@ -214,7 +216,7 @@ function findFile(name: string, subdir: string, ext: string): string | null {
 async function loadProvider(name: string): Promise<ProviderInvoke> {
   if (providerCache.has(name)) return providerCache.get(name)!
   const path = findFile(name, "providers", "ts|js")
-  if (!path) throw new Error(`Provider "${name}" not found in ${BUILTIN_DIR}/providers or ${USER_DIR}/providers`)
+  if (!path) throw new Error(`Provider "${name}" not found in any search path: ${SEARCH_DIRS.map(d => join(d, "providers")).join(", ")}`)
   const mod = await import(path)
   const invoke = mod.invoke ?? mod.default?.invoke
   if (typeof invoke !== "function") throw new Error(`Provider "${name}" must export invoke(ctx)`)
@@ -251,7 +253,7 @@ async function loadHooks(runDir: string): Promise<HookIndex> {
   const index: HookIndex = new Map()
   for (const name of VALID_EVENTS) index.set(name, [])
 
-  const dirs = [join(BUILTIN_DIR, "hooks"), join(USER_DIR, "hooks")]
+  const dirs = SEARCH_DIRS.map(d => join(d, "hooks"))
   const loaded: string[] = []
 
   for (const dir of dirs) {
@@ -600,7 +602,12 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
 
 export function buildCatalog(): string {
   const entries: string[] = []
-  for (const [dir, source] of [[join(BUILTIN_DIR, "workflows"), "built-in"], [join(USER_DIR, "workflows"), "library"]] as const) {
+  const sources: Array<[string, string]> = [
+    [join(PROJECT_DIR, "workflows"), "project"],
+    [join(USER_DIR, "workflows"), "library"],
+    [join(BUILTIN_DIR, "workflows"), "built-in"],
+  ]
+  for (const [dir, source] of sources) {
     let files: string[]
     try { files = readdirSync(dir).filter((f: string) => f.endsWith(".workflow.ts")) } catch { continue }
     for (const file of files) {
@@ -618,7 +625,7 @@ export function buildCatalog(): string {
 
 export function resolveWorkflow(name: string): string | null {
   const file = name.endsWith(".workflow.ts") ? name : `${name}.workflow.ts`
-  for (const base of [BUILTIN_DIR, USER_DIR]) {
+  for (const base of SEARCH_DIRS) {
     const p = join(base, "workflows", file)
     if (existsSync(p)) return p
   }
