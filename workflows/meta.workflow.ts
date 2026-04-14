@@ -112,6 +112,18 @@ Agents run as full coding agents (e.g. Claude Code CLI) with filesystem access. 
 - Guardrails that verify work products should check filesystem state, not output content
 - Example guardrail checking a file was created: { "check": "require('fs').existsSync('README.md')", "reason": "README.md was not created" }
 
+## Performance rules
+
+EXPLORER/ANALYST agents are the #1 bottleneck. Constrain them:
+- Always add to their systemPrompt: "Keep your output under 2000 words. Summarize findings, don't dump raw content."
+- Use "slice" to limit what context they receive — don't pass the entire context to explorers
+- If an explorer only needs to check specific files, say so in the instruction
+
+IMPLEMENTER agents are the #2 bottleneck. Parallelize them:
+- When 2+ files/modules can be built independently, ALWAYS use fork/join — never serialize independent work
+- Each fork branch should handle one focused unit (one file, one module, one component)
+- The join node should integrate/review, not re-implement
+
 ## Rules
 
 1. Every agent referenced in nodes MUST exist in registry
@@ -119,7 +131,7 @@ Agents run as full coding agents (e.g. Claude Code CLI) with filesystem access. 
 3. Every graph needs exactly one "done" and one "paused" node minimum
 4. Give each agent a clear systemPrompt defining its role and expected actions (not output format — agents act, not produce text)
 5. Match workflow complexity to task complexity — don't over-engineer simple tasks
-6. For multi-file tasks, prefer fork/join to serialize agents unnecessarily
+6. For multi-file tasks, ALWAYS prefer fork/join over serial agents — parallel branches are 3-4x faster
 7. Output must be parseable by JSON.parse() — no trailing commas, no comments
 8. Keep agent system prompts focused: role + what to do on the filesystem
 9. REUSE FIRST: if [catalog] contains a workflow that fits the task, output it as-is or adapt it. Only design from scratch if nothing matches.

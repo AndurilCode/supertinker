@@ -390,8 +390,7 @@ async function invokeAgent(
     const invoke = await loadProvider(def.command)
     return await invoke({ userPrompt, systemPrompt: sysPrompt, options: Object.keys(node.options ?? {}), cwd, model: def.model, logFile })
   } finally {
-    await new Promise(r => setTimeout(r, 800))
-    tmux("kill-window", `node-${node.id}`)
+    setTimeout(() => tmux("kill-window", `node-${node.id}`), 800)
   }
 }
 
