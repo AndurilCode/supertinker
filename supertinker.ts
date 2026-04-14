@@ -719,14 +719,35 @@ async function cli(): Promise<void> {
     return
   }
 
-  if (cmd === "list") { console.log(buildCatalog()); return }
+  if (cmd === "list") {
+    const flag = argv[1]
+    if (flag === "--hooks") {
+      const tmpDir = join("/tmp/orchestrator", "hook-list")
+      mkdirSync(tmpDir, { recursive: true })
+      const hooks = await loadHooks(tmpDir)
+      const entries: string[] = []
+      const seen = new Set<string>()
+      for (const [, hookList] of hooks) {
+        for (const h of hookList) {
+          if (seen.has(h.name)) continue
+          seen.add(h.name)
+          entries.push(`- ${h.name}: ${h.description ?? "(no description)"}  events: [${h.events.join(", ")}]  parallel: ${h.parallel}  priority: ${h.priority}`)
+        }
+      }
+      console.log(entries.length === 0 ? "No hooks found." : `Hooks (${entries.length}):\n${entries.join("\n")}`)
+      return
+    }
+    console.log(buildCatalog())
+    return
+  }
 
   console.log(`supertinker — minimal agent orchestrator
 
 Commands:
   run     [--workflow <name|path>] --prompt <text>   (default: meta)
   resume  --run <runId> --choice <label> --workflow <name|path>
-  list    show available workflows
+  list           show available workflows
+  list --hooks   show discovered hooks
 
 Examples:
   tsx supertinker.ts run --prompt "Build a REST API"
