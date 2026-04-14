@@ -429,8 +429,8 @@ function evalGuardrail(
   if (g.nodeId && g.nodeId !== ctx.nodeId) return { pass: true }
   try {
     const { output = "", choice = "", nodeId, context } = ctx
-    const pass = new Function("output", "choice", "nodeId", "context",
-      `"use strict"; return !!(${g.check})`)(output, choice, nodeId, context)
+    const pass = new Function("output", "choice", "nodeId", "context", "require",
+      `"use strict"; return !!(${g.check})`)(output, choice, nodeId, context, require)
     return pass ? { pass: true } : { pass: false, reason: g.reason }
   } catch (err) { return { pass: false, reason: `guardrail eval error: ${err}` } }
 }

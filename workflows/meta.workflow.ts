@@ -92,27 +92,36 @@ Each rule is a JSON object with a JS expression that gets evaluated at runtime:
 
 { "check": "<JS expression>", "reason": "<message on failure>", "nodeId": "<optional — scope to one node>" }
 
-Available variables in the expression: output (string), choice (string), nodeId (string), context (object).
+Available variables in the expression: output (string), choice (string), nodeId (string), context (object), require (function — for filesystem checks like require('fs').existsSync(...)).
 
 Examples:
-  { "check": "output.includes('## Steps')", "reason": "Missing ## Steps section", "nodeId": "plan" }
+  { "check": "output.trim().length > 0", "reason": "Empty output" }
   { "check": "output.length < 10000", "reason": "Output too long" }
   { "check": "!/(sk-|ghp_|AKIA)[A-Za-z0-9]{10,}/.test(output)", "reason": "Contains API key" }
-  { "check": "output.trim().length > 0", "reason": "Empty output" }
+  { "check": "require('fs').existsSync('README.md')", "reason": "README.md was not created", "nodeId": "write" }
+  { "check": "require('fs').statSync('src/index.ts').size > 0", "reason": "src/index.ts is empty", "nodeId": "implement" }
 
 On failure: post-guardrails retry the agent once with the reason injected, then pause. Pre-guardrails pause immediately.
 Use maxIterations (default: 3) on any workflow with review loops to prevent infinite cycling.
+
+## Agents are coding agents
+
+Agents run as full coding agents (e.g. Claude Code CLI) with filesystem access. They can read files, write files, run commands, and modify the codebase directly. Design workflows accordingly:
+- Agent system prompts should instruct agents to ACT on the codebase (read, write, modify files) — not to return file content as output
+- Agent output (the "output" field) should be a brief status/summary of what was done, not the full content
+- Guardrails that verify work products should check filesystem state, not output content
+- Example guardrail checking a file was created: { "check": "require('fs').existsSync('README.md')", "reason": "README.md was not created" }
 
 ## Rules
 
 1. Every agent referenced in nodes MUST exist in registry
 2. Use "claude" as command, "sonnet" as model for all agents
 3. Every graph needs exactly one "done" and one "paused" node minimum
-4. Give each agent a clear systemPrompt defining its role and output format
+4. Give each agent a clear systemPrompt defining its role and expected actions (not output format — agents act, not produce text)
 5. Match workflow complexity to task complexity — don't over-engineer simple tasks
 6. For multi-file tasks, prefer fork/join to serialize agents unnecessarily
 7. Output must be parseable by JSON.parse() — no trailing commas, no comments
-8. Keep agent system prompts focused: role + expected output format only
+8. Keep agent system prompts focused: role + what to do on the filesystem
 9. REUSE FIRST: if [catalog] contains a workflow that fits the task, output it as-is or adapt it. Only design from scratch if nothing matches.
 10. Always set maxIterations on workflows with review loops to prevent infinite cycling`
     }
