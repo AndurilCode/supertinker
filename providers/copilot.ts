@@ -13,6 +13,7 @@ interface ProviderContext {
 interface AgentResult {
   output: string
   choice: string
+  transcriptPath?: string
 }
 
 function run(command: string, args: string[], cwd: string, logFile: string): Promise<string> {
@@ -38,6 +39,16 @@ function extractContent(raw: string): string {
     } catch { /* not JSON */ }
   }
   return raw
+}
+
+function extractSessionId(raw: string): string | null {
+  for (const line of raw.trim().split("\n")) {
+    try {
+      const evt = JSON.parse(line)
+      if (evt.type === "session.start" && evt.data?.sessionId) return evt.data.sessionId
+    } catch { /* not JSON */ }
+  }
+  return null
 }
 
 function parseSentinel(raw: string, options: string[]): AgentResult | null {
@@ -69,5 +80,11 @@ export async function invoke(ctx: ProviderContext, retry = false): Promise<Agent
 
   if (!result && !retry) return invoke(ctx, true)
   if (!result) throw new Error(`No valid sentinel after retry. Output: ${content.slice(0, 300)}`)
+
+  const sessionId = extractSessionId(raw)
+  if (sessionId) {
+    result.transcriptPath = `${process.env.HOME}/.copilot/session-state/${sessionId}/events.jsonl`
+  }
+
   return result
 }
