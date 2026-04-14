@@ -7,9 +7,9 @@
  *   tsx supertinker.ts resume --run <runId> --choice <label> --graph ./graph.ts --registry ./registry.ts
  */
 
-import { spawn }                                              from "child_process"
 import { appendFileSync, existsSync, mkdirSync,
          readdirSync, readFileSync, writeFileSync }           from "fs"
+import { spawn }                                              from "child_process"
 import { join, resolve }                                      from "path"
 import { homedir }                                            from "os"
 
@@ -224,143 +224,47 @@ function buildSystemPrompt(registry: AgentRegistry, node: GraphNode): string {
   ].filter(Boolean).join("\n\n")
 }
 
-// ─── PROCESS RUNNER ───────────────────────────────────────────────────────────
+// ─── PROVIDERS ───────────────────────────────────────────────────────────────
 
-function runProcess(
-  command: string,
-  args: string[],
-  stdinText: string,
-  cwd: string,
-  logFile: string,
-): Promise<string> {
-  return new Promise((res, rej) => {
-    const proc = spawn(command, args, { cwd, env: process.env })
-    let out = ""
-    let err = ""
-
-    proc.stdout.on("data", (chunk: Buffer) => {
-      const txt = chunk.toString()
-      out += txt
-      appendFileSync(logFile, txt)      // live write → tmux tail sees it
-    })
-    proc.stderr.on("data", (chunk: Buffer) => { err += chunk.toString() })
-
-    proc.on("close", code =>
-      code === 0 ? res(out) : rej(new Error(`exit ${code}: ${err.slice(0, 300)}`))
-    )
-
-    if (stdinText) { proc.stdin.write(stdinText); proc.stdin.end() }
-    else proc.stdin.end()
-  })
+export interface ProviderContext {
+  userPrompt:   string
+  systemPrompt: string
+  options:      string[]    // available choice labels
+  cwd:          string
+  model?:       string
+  logFile:      string
 }
 
-// ─── ADAPTERS ─────────────────────────────────────────────────────────────────
+export type ProviderInvoke = (ctx: ProviderContext) => Promise<AgentResult>
 
-// Claude Code: --json-schema enforces {output, choice} — no sentinel needed
-async function adaptClaudeCode(
-  node: GraphNode,
-  systemPrompt: string,
-  userPrompt: string,
-  cwd: string,
-  logFile: string,
-  model?: string,
-): Promise<AgentResult> {
-  const schema = JSON.stringify({
-    type: "object",
-    required: ["output", "choice"],
-    properties: {
-      output: { type: "string" },
-      choice: { type: "string", enum: Object.keys(node.options!) },
-    },
-  })
+const BUILTIN_PROVIDERS_DIR = resolve(join(new URL(import.meta.url).pathname, "..", "providers"))
+const USER_PROVIDERS_DIR    = join(homedir(), ".supertinker", "providers")
+const providerCache = new Map<string, ProviderInvoke>()
 
-  const args = [
-    "-p", userPrompt,
-    "--system-prompt", systemPrompt,
-    "--output-format", "json",
-    "--json-schema", schema,
-    "--dangerously-skip-permissions",
-    ...(model ? ["--model", model] : []),
-  ]
-
-  const raw  = await runProcess("claude", args, "", cwd, logFile)
-
-  // Claude Code JSON output is wrapped: { type: "result", ..., structured_output: {output, choice} }
-  const parsed = JSON.parse(raw.trim())
-  if (parsed.output !== undefined && parsed.choice !== undefined) return parsed
-  if (parsed.structured_output?.output !== undefined && parsed.structured_output?.choice !== undefined) return parsed.structured_output
-  if (parsed.result) return JSON.parse(parsed.result)
-  throw new Error(`Unexpected Claude Code output shape: ${raw.slice(0, 200)}`)
-}
-
-// Copilot CLI: sentinel block parsing + one retry
-function parseSentinel(raw: string, options: Record<string, string>): AgentResult | null {
-  const m = raw.match(/---CHOICE---\s*\n\s*(\S+)\s*\n\s*---END---/)
-  if (!m) return null
-  const choice = m[1].trim()
-  if (!(choice in options)) return null
-  const output = raw.slice(0, raw.indexOf("---CHOICE---")).trim()
-  return { output, choice }
-}
-
-// Extract the agent's text from Copilot JSONL output
-function extractCopilotContent(raw: string): string {
-  const lines = raw.trim().split("\n")
-  for (let i = lines.length - 1; i >= 0; i--) {
-    try {
-      const evt = JSON.parse(lines[i])
-      if (evt.type === "assistant.message" && evt.data?.content) return evt.data.content
-    } catch { /* not JSON — skip */ }
+function findProvider(name: string): string | null {
+  for (const dir of [BUILTIN_PROVIDERS_DIR, USER_PROVIDERS_DIR]) {
+    const ts = join(dir, `${name}.ts`)
+    const js = join(dir, `${name}.js`)
+    if (existsSync(ts)) return ts
+    if (existsSync(js)) return js
   }
-  // Fallback: treat the whole output as plain text (e.g. if --output-format json wasn't used)
-  return raw
+  return null
 }
 
-async function adaptCopilot(
-  node: GraphNode,
-  systemPrompt: string,
-  userPrompt: string,
-  cwd: string,
-  logFile: string,
-  model?: string,
-  retry = false,
-): Promise<AgentResult> {
-  const retryHint = retry
-    ? "\n\nWARNING: Your previous response was missing the ---CHOICE--- sentinel block. Include it now."
-    : ""
+async function loadProvider(name: string): Promise<ProviderInvoke> {
+  if (providerCache.has(name)) return providerCache.get(name)!
 
-  const fullPrompt = `${systemPrompt}\n\n${userPrompt}${retryHint}`
-  const args = [
-    "-p", fullPrompt,
-    "--autopilot",
-    "--yolo",
-    "--output-format", "json",
-    ...(model ? ["--model", model] : []),
-  ]
-  const raw = await runProcess("copilot", args, "", cwd, logFile)
-  const content = extractCopilotContent(raw)
-  const result = parseSentinel(content, node.options!)
+  const path = findProvider(name)
+  if (!path) throw new Error(`Provider "${name}" not found. Searched: ${BUILTIN_PROVIDERS_DIR}, ${USER_PROVIDERS_DIR}`)
 
-  if (!result && !retry) return adaptCopilot(node, systemPrompt, userPrompt, cwd, logFile, model, true)
-  if (!result) throw new Error(`No valid sentinel after retry. Output: ${content.slice(0, 300)}`)
-  return result
-}
+  const mod = await import(path)
+  const invoke = mod.invoke ?? mod.default?.invoke
+  if (typeof invoke !== "function") {
+    throw new Error(`Provider "${name}" must export an invoke(ctx) function`)
+  }
 
-// Generic adapter — works for any CLI that reads a prompt from args
-// Uses the sentinel approach (same as Copilot)
-async function adaptGeneric(
-  command: string,
-  node: GraphNode,
-  systemPrompt: string,
-  userPrompt: string,
-  cwd: string,
-  logFile: string,
-): Promise<AgentResult> {
-  const fullPrompt = `${systemPrompt}\n\n${userPrompt}`
-  const raw = await runProcess(command, [fullPrompt], "", cwd, logFile)
-  const result = parseSentinel(raw, node.options!)
-  if (!result) throw new Error(`No valid sentinel. Output: ${raw.slice(0, 300)}`)
-  return result
+  providerCache.set(name, invoke)
+  return mod.invoke
 }
 
 // ─── AGENT INVOCATION ─────────────────────────────────────────────────────────
@@ -377,11 +281,15 @@ async function invokeAgent(node: GraphNode, state: RunState): Promise<AgentResul
   openNodePane(node.id, logFile)
 
   try {
-    switch (def.command) {
-      case "claude":  return await adaptClaudeCode(node, sysPrompt, userPrompt, cwd, logFile, def.model)
-      case "copilot": return await adaptCopilot(node, sysPrompt, userPrompt, cwd, logFile, def.model)
-      default:        return await adaptGeneric(def.command, node, sysPrompt, userPrompt, cwd, logFile)
-    }
+    const invoke = await loadProvider(def.command)
+    return await invoke({
+      userPrompt,
+      systemPrompt: sysPrompt,
+      options: Object.keys(node.options ?? {}),
+      cwd,
+      model: def.model,
+      logFile,
+    })
   } finally {
     await new Promise(r => setTimeout(r, 800))   // brief pause so human sees final output
     closeNodePane(node.id)
@@ -660,28 +568,43 @@ async function executeNode(
 
 // ─── WORKFLOW LIBRARY ─────────────────────────────────────────────────────────
 
-const LIBRARY_DIR = join(homedir(), ".supertinker", "workflows")
+const BUILTIN_WORKFLOWS_DIR = resolve(join(new URL(import.meta.url).pathname, "..", "workflows"))
+const USER_WORKFLOWS_DIR    = join(homedir(), ".supertinker", "workflows")
+
+function scanWorkflowDir(dir: string): string[] {
+  try {
+    mkdirSync(dir, { recursive: true })
+    return readdirSync(dir).filter(f => f.endsWith(".workflow.ts"))
+  } catch { return [] }
+}
 
 export function buildCatalog(): string {
-  mkdirSync(LIBRARY_DIR, { recursive: true })
-  const files = readdirSync(LIBRARY_DIR).filter(f => f.endsWith(".workflow.ts"))
-
-  if (files.length === 0) return "No saved workflows in library."
-
   const entries: string[] = []
-  for (const file of files) {
-    try {
-      const raw = readFileSync(join(LIBRARY_DIR, file), "utf8")
-      const idMatch   = raw.match(/"id"\s*:\s*"([^"]+)"/)
-      const descMatch = raw.match(/"description"\s*:\s*"([^"]+)"/)
-      const nodeCount = (raw.match(/"id"\s*:/g) || []).length - 1  // subtract the top-level id
-      const id   = idMatch?.[1]   ?? file
-      const desc = descMatch?.[1] ?? "(no description)"
-      entries.push(`- ${id}: ${desc} (${nodeCount} nodes) [${file}]`)
-    } catch { /* skip unreadable files */ }
+
+  for (const [dir, source] of [[BUILTIN_WORKFLOWS_DIR, "built-in"], [USER_WORKFLOWS_DIR, "library"]] as const) {
+    for (const file of scanWorkflowDir(dir)) {
+      try {
+        const raw = readFileSync(join(dir, file), "utf8")
+        const idMatch   = raw.match(/(?:"id"|id)\s*:\s*"([^"]+)"/)
+        const descMatch = raw.match(/(?:"description"|description)\s*:\s*"([^"]+)"/)
+        const nodeCount = (raw.match(/(?:"id"|id)\s*:/g) || []).length - 1
+        const id   = idMatch?.[1]   ?? file
+        const desc = descMatch?.[1] ?? "(no description)"
+        entries.push(`- ${id}: ${desc} (${nodeCount} nodes) [${source}: ${file}]`)
+      } catch { /* skip unreadable files */ }
+    }
   }
 
-  return `Saved workflows (${entries.length}):\n${entries.join("\n")}`
+  if (entries.length === 0) return "No workflows available."
+  return `Available workflows (${entries.length}):\n${entries.join("\n")}`
+}
+
+export function resolveWorkflow(name: string): string | null {
+  for (const dir of [BUILTIN_WORKFLOWS_DIR, USER_WORKFLOWS_DIR]) {
+    const path = join(dir, name.endsWith(".workflow.ts") ? name : `${name}.workflow.ts`)
+    if (existsSync(path)) return path
+  }
+  return null
 }
 
 // ─── PUBLIC API ───────────────────────────────────────────────────────────────
@@ -775,13 +698,11 @@ async function cli(): Promise<void> {
   const get     = (flag: string) => argv[argv.indexOf(flag) + 1] as string | undefined
 
   if (command === "run") {
-    const workflowPath = get("--workflow")
+    const workflowRef  = get("--workflow") ?? "meta"
     const prompt       = get("--prompt")
-    if (!workflowPath) {
-      console.error("Usage: supertinker run --workflow <path> --prompt <text>")
-      process.exit(1)
-    }
-    const { workflow } = await import(resolve(workflowPath))
+    // Resolve: try as built-in/library name first, then as file path
+    const workflowPath = resolveWorkflow(workflowRef) ?? resolve(workflowRef)
+    const { workflow } = await import(workflowPath)
     const initialContext: Context = { catalog: buildCatalog() }
     if (prompt) initialContext.task = prompt
     await run({ workflow, initialContext })
@@ -791,13 +712,19 @@ async function cli(): Promise<void> {
   if (command === "resume") {
     const runId        = get("--run")
     const choice       = get("--choice")
-    const workflowPath = get("--workflow")
-    if (!runId || !choice || !workflowPath) {
-      console.error("Usage: supertinker resume --run <runId> --choice <label> --workflow <path>")
+    const workflowRef  = get("--workflow")
+    if (!runId || !choice || !workflowRef) {
+      console.error("Usage: supertinker resume --run <runId> --choice <label> --workflow <name|path>")
       process.exit(1)
     }
-    const { workflow } = await import(resolve(workflowPath))
+    const workflowPath = resolveWorkflow(workflowRef) ?? resolve(workflowRef)
+    const { workflow } = await import(workflowPath)
     await resume({ workflow, runId, choice })
+    return
+  }
+
+  if (command === "list") {
+    console.log(buildCatalog())
     return
   }
 
@@ -805,12 +732,14 @@ async function cli(): Promise<void> {
 supertinker — minimal agent orchestrator
 
 Commands:
-  run     --workflow <path> --prompt <text>
-  resume  --run <runId> --choice <label> --workflow <path>
+  run     --workflow <name|path> --prompt <text>
+  resume  --run <runId> --choice <label> --workflow <name|path>
+  list    show available workflows (built-in + library)
 
 Example:
-  tsx supertinker.ts run --workflow ./workflow.ts --prompt "Build a REST API"
-  tsx supertinker.ts resume --run plan-develop-review-1234567890 --choice approved --workflow ./workflow.ts
+  tsx supertinker.ts run --workflow meta --prompt "Build a REST API"
+  tsx supertinker.ts run --workflow ./my-workflow.ts --prompt "Fix the bug"
+  tsx supertinker.ts list
   `)
 }
 
@@ -846,7 +775,11 @@ const isMain = process.argv[1] && (
 )
 
 if (isMain) {
-  if (ensureTmux()) {
+  const cmd = process.argv[2]
+  // Commands that don't need tmux
+  if (cmd === "list" || cmd === "help" || !cmd) {
+    cli().catch(err => { console.error(err); process.exit(1) })
+  } else if (ensureTmux()) {
     cli().catch(err => { console.error(err); process.exit(1) })
   }
 }
