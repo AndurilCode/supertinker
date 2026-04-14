@@ -14,6 +14,7 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync,
 import { spawn, spawnSync }                                     from "child_process"
 import { join, resolve }                                        from "path"
 import { homedir }                                              from "os"
+import { createRequire }                                        from "module"
 
 // ─── TYPES
 
@@ -403,8 +404,9 @@ function evalGuardrail(
   if (g.nodeId && g.nodeId !== ctx.nodeId) return { pass: true }
   try {
     const { output = "", choice = "", nodeId, context } = ctx
+    const esmRequire = createRequire(import.meta.url)
     const pass = new Function("output", "choice", "nodeId", "context", "require",
-      `"use strict"; return !!(${g.check})`)(output, choice, nodeId, context, require)
+      `"use strict"; return !!(${g.check})`)(output, choice, nodeId, context, esmRequire)
     return pass ? { pass: true } : { pass: false, reason: g.reason }
   } catch (err) { return { pass: false, reason: `guardrail eval error: ${err}` } }
 }
@@ -679,7 +681,7 @@ async function cli(): Promise<void> {
     const prompt       = get("--prompt")
     const workflowPath = resolveWorkflow(workflowRef) ?? resolve(workflowRef)
     const { workflow } = await import(workflowPath)
-    const initialContext: Context = { catalog: buildCatalog() }
+    const initialContext: Context = { catalog: buildCatalog(), cwd: process.cwd() }
     if (prompt) initialContext.task = prompt
     await run({ workflow, initialContext })
     return

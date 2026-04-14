@@ -156,7 +156,7 @@ Agents run as full coding agents (e.g. Claude Code CLI) with filesystem access. 
       {
         id: "design",
         agent: "architect",
-        instruction: "Check the workflow library in [catalog]. If an existing workflow matches the task in [task], output it as-is or with modifications. Only design from scratch if nothing fits. Output ONLY the raw Workflow JSON.",
+        instruction: "The working directory is [cwd]. Check it for any existing artifacts relevant to the task — don't redo work that's already done. Check the workflow library in [catalog]. If an existing workflow matches the task in [task], output it as-is or with modifications. Only design from scratch if nothing fits. Set cwd on agent nodes to [cwd] when the task targets an existing project. Output ONLY the raw Workflow JSON.",
         options: {
           done: "execute"
         }
@@ -166,7 +166,6 @@ Agents run as full coding agents (e.g. Claude Code CLI) with filesystem access. 
         type: "subworkflow",
         source: "design",
         slice: ["task"],            // only pass task to inner workflow, not the raw design JSON
-        cwd: "/tmp/supertinker-meta",
         options: {
           done: "complete"
         }
