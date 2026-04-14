@@ -9,14 +9,15 @@
 
 import { spawn }                                              from "child_process"
 import { appendFileSync, existsSync, mkdirSync,
-         readFileSync, writeFileSync }                        from "fs"
+         readdirSync, readFileSync, writeFileSync }           from "fs"
 import { join, resolve }                                      from "path"
+import { homedir }                                            from "os"
 
 // ─── TYPES ────────────────────────────────────────────────────────────────────
 
 export interface GraphNode {
   id:           string
-  type?:        "fork" | "join" | "done" | "failed" | "paused"
+  type?:        "fork" | "join" | "done" | "failed" | "paused" | "subworkflow"
   // standard node
   agent?:       string
   cwd?:         string
@@ -29,6 +30,8 @@ export interface GraphNode {
   targets?:     string[]
   // join
   waits_for?:   string[]
+  // subworkflow
+  source?:      string                   // context key containing Workflow JSON
 }
 
 export interface Graph {
@@ -55,9 +58,15 @@ export type GuardrailCheck = (ctx: {
   choice?:  string
 }) => { pass: true } | { pass: false; reason: string }
 
+export interface GuardrailRule {
+  check:   string    // JS expression — evaluated with { output, choice, nodeId, context } in scope
+  reason:  string    // message on failure
+  nodeId?: string    // if set, only applies to this node
+}
+
 export interface Guardrails {
-  pre?:           GuardrailCheck[]
-  post?:          GuardrailCheck[]
+  pre?:           (GuardrailCheck | GuardrailRule)[]
+  post?:          (GuardrailCheck | GuardrailRule)[]
   maxIterations?: number
 }
 
@@ -157,6 +166,36 @@ function renderUserPrompt(context: Context, instruction?: string): string {
 // Overwrite — last iteration wins (loop-safe, no version suffix)
 function appendContext(context: Context, nodeId: string, output: string): void {
   context[nodeId] = output
+}
+
+// Validate that every [variable] reference in node instructions can be resolved.
+// A reference is resolvable if it names a node in the graph (its output will be
+// written to context when that node runs) or is already present in initialContext.
+// Throws with a descriptive message listing every unresolved reference so the
+// caller can fail fast before any agent is dispatched.
+function validateTemplateVariables(graph: Graph, initialContext: Context): void {
+  const nodeIds = new Set(graph.nodes.map(n => n.id))
+  const unresolved: Array<{ nodeId: string; variable: string }> = []
+
+  for (const node of graph.nodes) {
+    if (!node.instruction) continue
+    for (const match of node.instruction.matchAll(/\[(\w[\w-]*)\]/g)) {
+      const variable = match[1]
+      if (!nodeIds.has(variable) && !(variable in initialContext)) {
+        unresolved.push({ nodeId: node.id, variable })
+      }
+    }
+  }
+
+  if (unresolved.length > 0) {
+    const details = unresolved
+      .map(({ nodeId, variable }) => `  • [${variable}] in node "${nodeId}"`)
+      .join("\n")
+    throw new Error(
+      `Workflow "${graph.id}" has unresolved template variables.\n` +
+      `Add them to initialContext before calling run():\n${details}`
+    )
+  }
 }
 
 // ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
@@ -351,12 +390,32 @@ async function invokeAgent(node: GraphNode, state: RunState): Promise<AgentResul
 
 // ─── GUARDRAILS ──────────────────────────────────────────────────────────────
 
+function isRule(g: GuardrailCheck | GuardrailRule): g is GuardrailRule {
+  return typeof g === "object" && "check" in g && "reason" in g
+}
+
+function evalRule(
+  rule: GuardrailRule,
+  ctx: { context: Context; nodeId: string; output?: string; choice?: string },
+): { pass: true } | { pass: false; reason: string } {
+  if (rule.nodeId && rule.nodeId !== ctx.nodeId) return { pass: true }
+  try {
+    const { output = "", choice = "", nodeId, context } = ctx
+    const pass = new Function("output", "choice", "nodeId", "context",
+      `"use strict"; return !!(${rule.check})`
+    )(output, choice, nodeId, context)
+    return pass ? { pass: true } : { pass: false, reason: rule.reason }
+  } catch (err) {
+    return { pass: false, reason: `guardrail eval error: ${err}` }
+  }
+}
+
 function runGuardrails(
-  checks: GuardrailCheck[],
+  checks: (GuardrailCheck | GuardrailRule)[],
   ctx: { context: Context; nodeId: string; output?: string; choice?: string },
 ): { pass: true } | { pass: false; reason: string } {
   for (const check of checks) {
-    const result = check(ctx)
+    const result = isRule(check) ? evalRule(check, ctx) : check(ctx)
     if (!result.pass) return result
   }
   return { pass: true }
@@ -441,6 +500,91 @@ async function executeNode(
     // Last branch falls through — executes the join node as a standard node
   }
 
+  // ── Subworkflow — execute an agent-generated workflow ─────────────────────
+  if (node.type === "subworkflow") {
+    const sourceKey = node.source!
+    const raw = context[sourceKey]
+    if (!raw) {
+      log("ERROR", nodeId, `subworkflow source key "${sourceKey}" not found in context`)
+      return executeNode(node.fallback ?? graph.fallback, nodeId, state)
+    }
+
+    let inner: Workflow
+    try {
+      inner = JSON.parse(raw)
+    } catch (err) {
+      log("ERROR", nodeId, `failed to parse subworkflow from "${sourceKey}": ${err}`)
+      return executeNode(node.fallback ?? graph.fallback, nodeId, state)
+    }
+
+    // Save generated workflow as a reusable .workflow.ts file
+    const workflowFile = join(runDir, `${inner.id}.workflow.ts`)
+    const importPath = resolve("supertinker.ts").replace(/\.ts$/, "")
+    const tsContent = `import type { Workflow } from "${importPath}";\n\nexport const workflow: Workflow = ${JSON.stringify(inner, null, 2)};\n`
+    writeFileSync(workflowFile, tsContent)
+    log("SUBWORK", nodeId, `workflow saved → ${workflowFile}`)
+    log("SUBWORK", nodeId, `reuse: tsx supertinker.ts run --workflow ${workflowFile}`)
+    log("SUBWORK", nodeId, `executing workflow "${inner.id}" (${inner.graph.nodes.length} nodes)`)
+
+    const innerRunDir = join(runDir, `sub-${inner.id}`)
+    mkdirSync(innerRunDir, { recursive: true })
+    const innerLogFile = join(innerRunDir, "orchestrator.log")
+    const innerLog = makeLogger(innerLogFile)
+
+    // Only pass initialContext keys to inner workflow — not accumulated node outputs
+    const innerContext: Context = {}
+    for (const key of node.slice ?? Object.keys(context)) {
+      if (key in context && key !== sourceKey) innerContext[key] = context[key]
+    }
+
+    const innerState: RunState = {
+      runId:           `${state.runId}/${inner.id}`,
+      runDir:          innerRunDir,
+      context:         innerContext,
+      joinMap:         new Map(),
+      iterationCounts: new Map(),
+      graph:           inner.graph,
+      registry:        inner.registry,
+      guardrails: {
+        maxIterations: inner.guardrails?.maxIterations ?? state.guardrails.maxIterations,
+        pre:           [...(state.guardrails.pre ?? []),  ...(inner.guardrails?.pre ?? [])],
+        post:          [...(state.guardrails.post ?? []), ...(inner.guardrails?.post ?? [])],
+      },
+      log:             innerLog,
+    }
+
+    // Set cwd for inner workflow nodes that don't specify their own
+    const innerCwd = node.cwd ? resolve(node.cwd) : undefined
+    if (innerCwd) {
+      for (const n of inner.graph.nodes) {
+        if (!n.cwd && n.agent) n.cwd = innerCwd
+      }
+    }
+
+    try {
+      await executeNode(inner.graph.start, null, innerState)
+    } catch (err) {
+      log("ERROR", nodeId, `subworkflow failed: ${err}`)
+      return executeNode(node.fallback ?? graph.fallback, nodeId, state)
+    }
+
+    // Merge inner context back under this node's id
+    appendContext(context, nodeId, JSON.stringify(innerState.context))
+    writeFileSync(join(runDir, "context.json"), JSON.stringify(context, null, 2))
+
+    // Save to workflow library for reuse
+    const libraryDir = join(homedir(), ".supertinker", "workflows")
+    mkdirSync(libraryDir, { recursive: true })
+    const libraryFile = join(libraryDir, `${inner.id}.workflow.ts`)
+    writeFileSync(libraryFile, tsContent)
+    log("SUBWORK", nodeId, `library → ${libraryFile}`)
+    log("SUBWORK", nodeId, `completed — context merged`)
+
+    const nextNodeId = node.options?.["done"]
+    if (!nextNodeId) return
+    return executeNode(nextNodeId, nodeId, state)
+  }
+
   // ── Standard node ──────────────────────────────────────────────────────────
   const { guardrails, iterationCounts } = state
 
@@ -514,6 +658,32 @@ async function executeNode(
   return executeNode(nextNodeId, nodeId, state)
 }
 
+// ─── WORKFLOW LIBRARY ─────────────────────────────────────────────────────────
+
+const LIBRARY_DIR = join(homedir(), ".supertinker", "workflows")
+
+export function buildCatalog(): string {
+  mkdirSync(LIBRARY_DIR, { recursive: true })
+  const files = readdirSync(LIBRARY_DIR).filter(f => f.endsWith(".workflow.ts"))
+
+  if (files.length === 0) return "No saved workflows in library."
+
+  const entries: string[] = []
+  for (const file of files) {
+    try {
+      const raw = readFileSync(join(LIBRARY_DIR, file), "utf8")
+      const idMatch   = raw.match(/"id"\s*:\s*"([^"]+)"/)
+      const descMatch = raw.match(/"description"\s*:\s*"([^"]+)"/)
+      const nodeCount = (raw.match(/"id"\s*:/g) || []).length - 1  // subtract the top-level id
+      const id   = idMatch?.[1]   ?? file
+      const desc = descMatch?.[1] ?? "(no description)"
+      entries.push(`- ${id}: ${desc} (${nodeCount} nodes) [${file}]`)
+    } catch { /* skip unreadable files */ }
+  }
+
+  return `Saved workflows (${entries.length}):\n${entries.join("\n")}`
+}
+
 // ─── PUBLIC API ───────────────────────────────────────────────────────────────
 
 export async function run({
@@ -537,6 +707,9 @@ export async function run({
   log("RUN", runId, workflow.description)
   log("RUN", runId, `graph: ${graph.id}  nodes: ${graph.nodes.length}`)
   log("RUN", runId, `run dir: ${runDir}`)
+
+  // Fail fast if any [variable] references in node instructions are unresolvable
+  validateTemplateVariables(graph, initialContext)
 
   const state: RunState = {
     runId,
@@ -603,12 +776,15 @@ async function cli(): Promise<void> {
 
   if (command === "run") {
     const workflowPath = get("--workflow")
+    const prompt       = get("--prompt")
     if (!workflowPath) {
-      console.error("Usage: supertinker run --workflow <path>")
+      console.error("Usage: supertinker run --workflow <path> --prompt <text>")
       process.exit(1)
     }
     const { workflow } = await import(resolve(workflowPath))
-    await run({ workflow })
+    const initialContext: Context = { catalog: buildCatalog() }
+    if (prompt) initialContext.task = prompt
+    await run({ workflow, initialContext })
     return
   }
 
@@ -629,13 +805,37 @@ async function cli(): Promise<void> {
 supertinker — minimal agent orchestrator
 
 Commands:
-  run     --workflow <path>
+  run     --workflow <path> --prompt <text>
   resume  --run <runId> --choice <label> --workflow <path>
 
 Example:
-  tsx supertinker.ts run --workflow ./workflow.ts
+  tsx supertinker.ts run --workflow ./workflow.ts --prompt "Build a REST API"
   tsx supertinker.ts resume --run plan-develop-review-1234567890 --choice approved --workflow ./workflow.ts
   `)
+}
+
+// ─── TMUX AUTO-LAUNCH ────────────────────────────────────────────────────────
+
+function ensureTmux(): boolean {
+  if (tmuxRunning()) return true
+
+  // Re-launch ourselves inside a new tmux session (detached)
+  const args = process.argv.slice(1).map(a => `'${a}'`).join(" ")
+  const cmd  = `${process.argv[0]} ${args}`
+  const sess = `supertinker-${Date.now()}`
+
+  try {
+    const { execSync } = require("child_process")
+    execSync(`tmux new-session -d -s "${sess}" "${cmd}"`, { stdio: "ignore" })
+    console.log(`supertinker running in tmux session: ${sess}`)
+    console.log(`  attach:  tmux attach -t ${sess}`)
+    console.log(`  kill:    tmux kill-session -t ${sess}`)
+    return false  // we're the outer process — tmux is running in background
+  } catch {
+    // tmux not installed or failed — run without it
+    console.log("(tmux not available — running without panes)")
+    return true
+  }
 }
 
 // ─── ENTRYPOINT ───────────────────────────────────────────────────────────────
@@ -646,5 +846,7 @@ const isMain = process.argv[1] && (
 )
 
 if (isMain) {
-  cli().catch(err => { console.error(err); process.exit(1) })
+  if (ensureTmux()) {
+    cli().catch(err => { console.error(err); process.exit(1) })
+  }
 }
