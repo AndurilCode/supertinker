@@ -15,7 +15,7 @@ import { spawn, spawnSync }                                     from "child_proc
 import { join, resolve }                                        from "path"
 import { homedir }                                              from "os"
 
-// ─── TYPES ────────────────────────────────────────────────────────────────────
+// ─── TYPES
 
 export interface GraphNode {
   id:           string
@@ -73,7 +73,7 @@ interface RunState {
   graph: Graph; registry: AgentRegistry; guardrails: Guardrails; hooks: HookIndex
 }
 
-// ─── HOOKS ───────────────────────────────────────────────────────────────────
+// ─── HOOKS
 
 export type HookEventName =
   | "RunStart" | "RunEnd"
@@ -92,53 +92,22 @@ export interface HookEventBase {
   timestamp: number
 }
 
-export interface RunStartEvent extends HookEventBase {
-  event: "RunStart"; workflow: Workflow; initialContext: Context
-}
-export interface RunEndEvent extends HookEventBase {
-  event: "RunEnd"; terminal: "done" | "failed"; finalContext: Context
-}
-export interface PreAgentEvent extends HookEventBase {
-  event: "PreAgent"; nodeId: string; agent: string
-  userPrompt: string; systemPrompt: string; slicedContext: Context
-}
-export interface PostAgentEvent extends HookEventBase {
-  event: "PostAgent"; nodeId: string; agent: string
-  result: AgentResult; transcriptPath?: string
-}
-export interface PausedEvent extends HookEventBase {
-  event: "Paused"; nodeId: string; reason?: string; stateFile: string
-}
-export interface ResumedEvent extends HookEventBase {
-  event: "Resumed"; nodeId: string; choice: string
-}
-export interface ForkStartEvent extends HookEventBase {
-  event: "ForkStart"; nodeId: string; targets: string[]
-}
-export interface ForkJoinEvent extends HookEventBase {
-  event: "ForkJoin"; nodeId: string; joinedFrom: string[]
-}
-export interface GuardrailFailEvent extends HookEventBase {
-  event: "GuardrailFail"; nodeId: string; phase: "pre" | "post"; reason: string
-}
-export interface SubworkflowStartEvent extends HookEventBase {
-  event: "SubworkflowStart"; nodeId: string; innerWorkflow: Workflow
-}
-export interface SubworkflowEndEvent extends HookEventBase {
-  event: "SubworkflowEnd"; nodeId: string; innerContext: Context
-}
-export interface ErrorEvent extends HookEventBase {
-  event: "Error"; nodeId: string; error: string; fallbackNodeId?: string
+interface HookEventMap {
+  RunStart:         { workflow: Workflow; initialContext: Context }
+  RunEnd:           { terminal: "done" | "failed"; finalContext: Context }
+  PreAgent:         { nodeId: string; agent: string; userPrompt: string; systemPrompt: string; slicedContext: Context }
+  PostAgent:        { nodeId: string; agent: string; result: AgentResult; transcriptPath?: string }
+  Paused:           { nodeId: string; reason?: string; stateFile: string }
+  Resumed:          { nodeId: string; choice: string }
+  ForkStart:        { nodeId: string; targets: string[] }
+  ForkJoin:         { nodeId: string; joinedFrom: string[] }
+  GuardrailFail:    { nodeId: string; phase: "pre" | "post"; reason: string }
+  SubworkflowStart: { nodeId: string; innerWorkflow: Workflow }
+  SubworkflowEnd:   { nodeId: string; innerContext: Context }
+  Error:            { nodeId: string; error: string; fallbackNodeId?: string }
 }
 
-export type HookEvent =
-  | RunStartEvent | RunEndEvent
-  | PreAgentEvent | PostAgentEvent
-  | PausedEvent   | ResumedEvent
-  | ForkStartEvent | ForkJoinEvent
-  | GuardrailFailEvent
-  | SubworkflowStartEvent | SubworkflowEndEvent
-  | ErrorEvent
+export type HookEvent = { [K in HookEventName]: HookEventBase & { event: K } & HookEventMap[K] }[HookEventName]
 
 export type HookDirective =
   | { action: "continue" }
@@ -159,7 +128,7 @@ export interface Hook {
 
 export type HookIndex = Map<HookEventName, Hook[]>
 
-// ─── TMUX ─────────────────────────────────────────────────────────────────────
+// ─── TMUX
 
 function tmuxRunning(): boolean { return !!process.env.TMUX }
 
@@ -172,7 +141,7 @@ function tmux(action: "new-window" | "kill-window", name: string, cmd?: string):
   } catch { /* not in tmux */ }
 }
 
-// ─── CONTEXT ──────────────────────────────────────────────────────────────────
+// ─── CONTEXT
 
 function sliceContext(ctx: Context, keys?: string[]): Context {
   if (!keys) return ctx
@@ -201,7 +170,15 @@ function validateTemplateVariables(graph: Graph, initialContext: Context): void 
   }
 }
 
-// ─── SYSTEM PROMPT ────────────────────────────────────────────────────────────
+function resolveFallback(node: GraphNode, graph: Graph): string {
+  return node.fallback ?? graph.fallback
+}
+
+function saveContext(runDir: string, context: Context): void {
+  writeFileSync(join(runDir, "context.json"), JSON.stringify(context, null, 2))
+}
+
+// ─── SYSTEM PROMPT
 
 function buildSystemPrompt(registry: AgentRegistry, node: GraphNode): string {
   const def = registry[node.agent!]
@@ -211,7 +188,7 @@ function buildSystemPrompt(registry: AgentRegistry, node: GraphNode): string {
   return [def.systemPrompt, node.systemPrompt, optionsPrompt].filter(Boolean).join("\n\n")
 }
 
-// ─── PROVIDERS ───────────────────────────────────────────────────────────────
+// ─── PROVIDERS
 
 export interface ProviderContext {
   userPrompt: string; systemPrompt: string; options: string[]
@@ -244,7 +221,7 @@ async function loadProvider(name: string): Promise<ProviderInvoke> {
   return invoke
 }
 
-// ─── HOOK SYSTEM ─────────────────────────────────────────────────────────────
+// ─── HOOK SYSTEM
 
 const VALID_EVENTS = new Set<HookEventName>([
   "RunStart", "RunEnd", "PreAgent", "PostAgent", "Paused", "Resumed",
@@ -316,7 +293,7 @@ async function loadHooks(runDir: string): Promise<HookIndex> {
   }
 
   for (const hooks of index.values()) {
-    hooks.sort((a, b) => (a.priority ?? 50) - (b.priority ?? 50))
+    hooks.sort((a, b) => a.priority! - b.priority!)
   }
 
   if (loaded.length > 0) bootstrapLog(runDir, `loaded: ${loaded.join(", ")}`)
@@ -352,26 +329,21 @@ async function emitHook(
         new Promise<HookDirective>((_, rej) => setTimeout(() => rej(new Error("timeout")), hook.timeout ?? 30000)),
       ])
 
+      let directive: HookDirective = result
       if (result.action !== "continue") {
         const supported = DIRECTIVE_SUPPORT[result.action]
         if (!supported?.has(event)) {
           process.stderr.write(`HOOK-WARN ${hook.name}: "${result.action}" not supported for ${event}, treating as continue\n`)
-          directives.push({ directive: { action: "continue" }, priority: hook.priority ?? 50 })
+          directive = { action: "continue" }
         } else if (result.action === "redirect") {
           const rd = result as { action: "redirect"; targetNodeId: string }
-          const valid = state.graph.nodes.some(n => n.id === rd.targetNodeId)
-          if (!valid) {
+          if (!state.graph.nodes.some(n => n.id === rd.targetNodeId)) {
             process.stderr.write(`HOOK-WARN ${hook.name}: redirect target "${rd.targetNodeId}" not found, treating as continue\n`)
-            directives.push({ directive: { action: "continue" }, priority: hook.priority ?? 50 })
-          } else {
-            directives.push({ directive: result, priority: hook.priority ?? 50 })
+            directive = { action: "continue" }
           }
-        } else {
-          directives.push({ directive: result, priority: hook.priority ?? 50 })
         }
-      } else {
-        directives.push({ directive: result, priority: hook.priority ?? 50 })
       }
+      directives.push({ directive, priority: hook.priority ?? 50 })
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       process.stderr.write(`HOOK-ERR ${hook.name} ${event}: ${msg}\n`)
@@ -398,13 +370,15 @@ async function emitHook(
   return winner.directive
 }
 
-// ─── AGENT INVOCATION ─────────────────────────────────────────────────────────
+// ─── AGENT INVOCATION
 
-async function invokeAgent(node: GraphNode, state: RunState): Promise<AgentResult> {
+async function invokeAgent(
+  node: GraphNode, state: RunState,
+  precomputed?: { userPrompt: string; systemPrompt: string },
+): Promise<AgentResult> {
   const def        = state.registry[node.agent!]
-  const sliced     = sliceContext(state.context, node.slice)
-  const userPrompt = renderUserPrompt(sliced, node.instruction)
-  const sysPrompt  = buildSystemPrompt(state.registry, node)
+  const userPrompt = precomputed?.userPrompt  ?? renderUserPrompt(sliceContext(state.context, node.slice), node.instruction)
+  const sysPrompt  = precomputed?.systemPrompt ?? buildSystemPrompt(state.registry, node)
   const cwd        = resolve(node.cwd ?? process.cwd())
   const logFile    = join(state.runDir, `${node.id}.log`)
 
@@ -418,7 +392,7 @@ async function invokeAgent(node: GraphNode, state: RunState): Promise<AgentResul
   }
 }
 
-// ─── GUARDRAILS ──────────────────────────────────────────────────────────────
+// ─── GUARDRAILS
 
 function evalGuardrail(
   g: GuardrailCheck | GuardrailRule,
@@ -446,6 +420,21 @@ function runGuardrails(
   return { pass: true }
 }
 
+async function errorFallback(state: RunState, nodeId: string, node: GraphNode, error: string): Promise<void> {
+  const fallback = resolveFallback(node, state.graph)
+  await emitHook("Error", { nodeId, error, fallbackNodeId: fallback }, state)
+  return executeNode(fallback, nodeId, state)
+}
+
+async function applyDirective(
+  d: HookDirective, state: RunState, nodeId: string, node: GraphNode, fromNodeId: string | null,
+): Promise<true | void> {
+  if (d.action === "abort") throw new Error(`Aborted by hook: ${(d as { reason: string }).reason}`)
+  if (d.action === "pause")    { await writePause(state, nodeId, fromNodeId, (d as { reason: string }).reason); return true }
+  if (d.action === "redirect") { await executeNode((d as { targetNodeId: string }).targetNodeId, nodeId, state); return true }
+  if (d.action === "skip")     { await executeNode(resolveFallback(node, state.graph), nodeId, state); return true }
+}
+
 async function writePause(state: RunState, nodeId: string, fromNodeId: string | null, reason?: string): Promise<void> {
   const { runDir, context } = state
   const stateFile = join(runDir, "state.json")
@@ -454,23 +443,23 @@ async function writePause(state: RunState, nodeId: string, fromNodeId: string | 
     agentOutput: context[fromNodeId ?? ""] ?? "", reason,
   }
   writeFileSync(stateFile, JSON.stringify(paused, null, 2))
-  writeFileSync(join(runDir, "context.json"), JSON.stringify(context, null, 2))
+  saveContext(runDir, context)
   await emitHook("Paused", { nodeId, reason, stateFile }, state)
 }
 
-// ─── ORCHESTRATOR CORE ────────────────────────────────────────────────────────
+// ─── ORCHESTRATOR CORE
 
 async function executeNode(nodeId: string, fromNodeId: string | null, state: RunState): Promise<void> {
   const { graph, context, joinMap, runDir } = state
   const node = graph.nodes.find(n => n.id === nodeId)
   if (!node) throw new Error(`Node not found: "${nodeId}"`)
 
-  // ── Terminals ────────────────────────────────────────────────────────────
+  // ── Terminals
   if (node.type === "done")   { await emitHook("RunEnd", { terminal: "done", finalContext: context }, state); return }
   if (node.type === "failed") { await emitHook("RunEnd", { terminal: "failed", finalContext: context }, state); throw new Error("Graph reached failed terminal") }
   if (node.type === "paused") { await writePause(state, nodeId, fromNodeId); return }
 
-  // ── Fork ─────────────────────────────────────────────────────────────────
+  // ── Fork
   if (node.type === "fork") {
     const directive = await emitHook("ForkStart", { nodeId, targets: node.targets! }, state)
     if (directive.action === "abort") throw new Error(`Aborted by hook: ${(directive as { reason: string }).reason}`)
@@ -479,7 +468,7 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
     return
   }
 
-  // ── Join ─────────────────────────────────────────────────────────────────
+  // ── Join
   if (node.type === "join") {
     if (!joinMap.has(nodeId)) joinMap.set(nodeId, new Set())
     const arrived = joinMap.get(nodeId)!
@@ -487,22 +476,15 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
     if (arrived.size < node.waits_for!.length) return
   }
 
-  // ── Subworkflow ──────────────────────────────────────────────────────────
+  // ── Subworkflow
   if (node.type === "subworkflow") {
     const raw = context[node.source!]
-    if (!raw) {
-      await emitHook("Error", { nodeId, error: `source "${node.source}" not in context`, fallbackNodeId: node.fallback ?? graph.fallback }, state)
-      return executeNode(node.fallback ?? graph.fallback, nodeId, state)
-    }
+    if (!raw) return errorFallback(state, nodeId, node, `source "${node.source}" not in context`)
 
     let inner: Workflow
     try { inner = JSON.parse(raw) }
-    catch (err) {
-      await emitHook("Error", { nodeId, error: `bad workflow JSON: ${err}`, fallbackNodeId: node.fallback ?? graph.fallback }, state)
-      return executeNode(node.fallback ?? graph.fallback, nodeId, state)
-    }
+    catch (err) { return errorFallback(state, nodeId, node, `bad workflow JSON: ${err}`) }
 
-    // Save as reusable .workflow.ts
     const importPath = resolve("supertinker.ts").replace(/\.ts$/, "")
     const tsContent = `import type { Workflow } from "${importPath}";\n\nexport const workflow: Workflow = ${JSON.stringify(inner, null, 2)};\n`
     const workflowFile = join(runDir, `${inner.id}.workflow.ts`)
@@ -516,8 +498,10 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
     for (const key of node.slice ?? Object.keys(context))
       if (key in context && key !== node.source) innerContext[key] = context[key]
 
-    // Propagate cwd to inner nodes
-    if (node.cwd) { const cwd = resolve(node.cwd); for (const n of inner.graph.nodes) { if (!n.cwd && n.agent) n.cwd = cwd } }
+    if (node.cwd) {
+      const cwd = resolve(node.cwd)
+      inner = { ...inner, graph: { ...inner.graph, nodes: inner.graph.nodes.map(n => (!n.cwd && n.agent) ? { ...n, cwd } : n) } }
+    }
 
     const innerState: RunState = {
       runId: `${state.runId}/${inner.id}`, runDir: innerRunDir,
@@ -532,15 +516,11 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
     }
 
     try { await executeNode(inner.graph.start, null, innerState) }
-    catch (err) {
-      await emitHook("Error", { nodeId, error: String(err), fallbackNodeId: node.fallback ?? graph.fallback }, state)
-      return executeNode(node.fallback ?? graph.fallback, nodeId, state)
-    }
+    catch (err) { return errorFallback(state, nodeId, node, String(err)) }
 
     context[nodeId] = JSON.stringify(innerState.context)
-    writeFileSync(join(runDir, "context.json"), JSON.stringify(context, null, 2))
+    saveContext(runDir, context)
 
-    // Save to library
     const libDir = join(USER_DIR, "workflows"); mkdirSync(libDir, { recursive: true })
     copyFileSync(workflowFile, join(libDir, `${inner.id}.workflow.ts`))
     await emitHook("SubworkflowEnd", { nodeId, innerContext: innerState.context }, state)
@@ -550,7 +530,7 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
     return
   }
 
-  // ── Standard node ────────────────────────────────────────────────────────
+  // ── Standard node
   const { guardrails, iterationCounts } = state
   const count = (iterationCounts.get(nodeId) ?? 0) + 1
   iterationCounts.set(nodeId, count)
@@ -567,33 +547,26 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
     }
   }
 
+  const sliced     = sliceContext(context, node.slice)
+  const userPrompt = renderUserPrompt(sliced, node.instruction)
+  const sysPrompt  = buildSystemPrompt(state.registry, node)
+
   const preDirective = await emitHook("PreAgent", {
     nodeId, agent: node.agent!,
-    userPrompt: renderUserPrompt(sliceContext(context, node.slice), node.instruction),
-    systemPrompt: buildSystemPrompt(state.registry, node),
-    slicedContext: sliceContext(context, node.slice),
+    userPrompt, systemPrompt: sysPrompt, slicedContext: sliced,
   }, state)
 
-  if (preDirective.action === "abort") throw new Error(`Aborted by hook: ${(preDirective as { reason: string }).reason}`)
-  if (preDirective.action === "skip") return executeNode(node.fallback ?? graph.fallback, nodeId, state)
-  if (preDirective.action === "pause") return writePause(state, nodeId, fromNodeId, (preDirective as { reason: string }).reason)
-  if (preDirective.action === "redirect") return executeNode((preDirective as { targetNodeId: string }).targetNodeId, nodeId, state)
+  if (await applyDirective(preDirective, state, nodeId, node, fromNodeId)) return
 
   let result: AgentResult
-  try { result = await invokeAgent(node, state) }
-  catch (err) {
-    await emitHook("Error", { nodeId, error: String(err), fallbackNodeId: node.fallback ?? graph.fallback }, state)
-    return executeNode(node.fallback ?? graph.fallback, nodeId, state)
-  }
+  try { result = await invokeAgent(node, state, { userPrompt, systemPrompt: sysPrompt }) }
+  catch (err) { return errorFallback(state, nodeId, node, String(err)) }
 
   const postDirective = await emitHook("PostAgent", {
-    nodeId, agent: node.agent!,
-    result, transcriptPath: result.transcriptPath,
+    nodeId, agent: node.agent!, result, transcriptPath: result.transcriptPath,
   }, state)
 
-  if (postDirective.action === "abort") throw new Error(`Aborted by hook: ${(postDirective as { reason: string }).reason}`)
-  if (postDirective.action === "pause") return writePause(state, nodeId, fromNodeId, (postDirective as { reason: string }).reason)
-  if (postDirective.action === "redirect") return executeNode((postDirective as { targetNodeId: string }).targetNodeId, nodeId, state)
+  if (await applyDirective(postDirective, state, nodeId, node, fromNodeId)) return
 
   // Post-guardrails — retry once, then pause
   if (guardrails.post?.length) {
@@ -614,23 +587,21 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
   }
 
   const nextNodeId = node.options?.[result.choice]
-  if (!nextNodeId) {
-    await emitHook("Error", { nodeId, error: `choice "${result.choice}" not declared`, fallbackNodeId: node.fallback ?? graph.fallback }, state)
-    return executeNode(node.fallback ?? graph.fallback, nodeId, state)
-  }
+  if (!nextNodeId) return errorFallback(state, nodeId, node, `choice "${result.choice}" not declared`)
 
   context[nodeId] = result.output
-  writeFileSync(join(runDir, "context.json"), JSON.stringify(context, null, 2))
+  saveContext(runDir, context)
   return executeNode(nextNodeId, nodeId, state)
 }
 
-// ─── WORKFLOW LIBRARY ─────────────────────────────────────────────────────────
+// ─── WORKFLOW LIBRARY
 
 export function buildCatalog(): string {
   const entries: string[] = []
   for (const [dir, source] of [[join(BUILTIN_DIR, "workflows"), "built-in"], [join(USER_DIR, "workflows"), "library"]] as const) {
-    try { mkdirSync(dir, { recursive: true }) } catch {}
-    for (const file of (existsSync(dir) ? readdirSync(dir) : []).filter((f: string) => f.endsWith(".workflow.ts"))) {
+    let files: string[]
+    try { files = readdirSync(dir).filter((f: string) => f.endsWith(".workflow.ts")) } catch { continue }
+    for (const file of files) {
       try {
         const raw = readFileSync(join(dir, file), "utf8")
         const id   = raw.match(/(?:"id"|id)\s*:\s*"([^"]+)"/)?.[1] ?? file
@@ -652,7 +623,7 @@ export function resolveWorkflow(name: string): string | null {
   return null
 }
 
-// ─── PUBLIC API ───────────────────────────────────────────────────────────────
+// ─── PUBLIC API
 
 export async function run({ workflow, initialContext = {} }: { workflow: Workflow; initialContext?: Context }): Promise<void> {
   const { graph, registry } = workflow
@@ -696,7 +667,7 @@ export async function resume({ workflow, runId, choice }: { workflow: Workflow; 
   await executeNode(fromNode.options[choice], paused.nodeId, state)
 }
 
-// ─── CLI ──────────────────────────────────────────────────────────────────────
+// ─── CLI
 
 async function cli(): Promise<void> {
   const argv = process.argv.slice(2)
@@ -758,7 +729,7 @@ Examples:
   tsx supertinker.ts list`)
 }
 
-// ─── TMUX AUTO-LAUNCH ────────────────────────────────────────────────────────
+// ─── TMUXAUTO-LAUNCH ────────────────────────────────────────────────────────
 
 function ensureTmux(): boolean {
   if (tmuxRunning()) return true
@@ -776,7 +747,7 @@ function ensureTmux(): boolean {
   }
 }
 
-// ─── ENTRYPOINT ───────────────────────────────────────────────────────────────
+// ─── ENTRYPOINT
 
 const isMain = process.argv[1]?.endsWith("supertinker.ts") || process.argv[1]?.endsWith("supertinker.js")
 
