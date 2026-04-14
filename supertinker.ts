@@ -61,7 +61,7 @@ export interface Workflow {
   id: string; description: string; graph: Graph; registry: AgentRegistry; guardrails?: Guardrails
 }
 
-interface AgentResult { output: string; choice: string }
+export interface AgentResult { output: string; choice: string; transcriptPath?: string }
 
 export interface PausedState {
   runId: string; nodeId: string; context: Context; agentOutput: string; reason?: string
@@ -70,21 +70,94 @@ export interface PausedState {
 interface RunState {
   runId: string; runDir: string; context: Context
   joinMap: Map<string, Set<string>>; iterationCounts: Map<string, number>
-  graph: Graph; registry: AgentRegistry; guardrails: Guardrails; log: Logger
+  graph: Graph; registry: AgentRegistry; guardrails: Guardrails; hooks: HookIndex
 }
 
-type Logger = (level: string, nodeId: string, msg: string) => void
+// ─── HOOKS ───────────────────────────────────────────────────────────────────
 
-// ─── LOGGING ──────────────────────────────────────────────────────────────────
+export type HookEventName =
+  | "RunStart" | "RunEnd"
+  | "PreAgent" | "PostAgent"
+  | "Paused"   | "Resumed"
+  | "ForkStart" | "ForkJoin"
+  | "GuardrailFail"
+  | "SubworkflowStart" | "SubworkflowEnd"
+  | "Error"
 
-function makeLogger(logFile: string): Logger {
-  return (level, nodeId, msg) => {
-    const ts   = new Date().toISOString().slice(11, 19)
-    const line = `[${ts}] ${level.padEnd(7)} ${nodeId.padEnd(22)} ${msg}`
-    appendFileSync(logFile, line + "\n")
-    process.stdout.write(line + "\n")
-  }
+export interface HookEventBase {
+  event:     HookEventName
+  runId:     string
+  runDir:    string
+  context:   Context
+  timestamp: number
 }
+
+export interface RunStartEvent extends HookEventBase {
+  event: "RunStart"; workflow: Workflow; initialContext: Context
+}
+export interface RunEndEvent extends HookEventBase {
+  event: "RunEnd"; terminal: "done" | "failed"; finalContext: Context
+}
+export interface PreAgentEvent extends HookEventBase {
+  event: "PreAgent"; nodeId: string; agent: string
+  userPrompt: string; systemPrompt: string; slicedContext: Context
+}
+export interface PostAgentEvent extends HookEventBase {
+  event: "PostAgent"; nodeId: string; agent: string
+  result: AgentResult; transcriptPath?: string
+}
+export interface PausedEvent extends HookEventBase {
+  event: "Paused"; nodeId: string; reason?: string; stateFile: string
+}
+export interface ResumedEvent extends HookEventBase {
+  event: "Resumed"; nodeId: string; choice: string
+}
+export interface ForkStartEvent extends HookEventBase {
+  event: "ForkStart"; nodeId: string; targets: string[]
+}
+export interface ForkJoinEvent extends HookEventBase {
+  event: "ForkJoin"; nodeId: string; joinedFrom: string[]
+}
+export interface GuardrailFailEvent extends HookEventBase {
+  event: "GuardrailFail"; nodeId: string; phase: "pre" | "post"; reason: string
+}
+export interface SubworkflowStartEvent extends HookEventBase {
+  event: "SubworkflowStart"; nodeId: string; innerWorkflow: Workflow
+}
+export interface SubworkflowEndEvent extends HookEventBase {
+  event: "SubworkflowEnd"; nodeId: string; innerContext: Context
+}
+export interface ErrorEvent extends HookEventBase {
+  event: "Error"; nodeId: string; error: string; fallbackNodeId?: string
+}
+
+export type HookEvent =
+  | RunStartEvent | RunEndEvent
+  | PreAgentEvent | PostAgentEvent
+  | PausedEvent   | ResumedEvent
+  | ForkStartEvent | ForkJoinEvent
+  | GuardrailFailEvent
+  | SubworkflowStartEvent | SubworkflowEndEvent
+  | ErrorEvent
+
+export type HookDirective =
+  | { action: "continue" }
+  | { action: "skip" }
+  | { action: "pause";    reason: string }
+  | { action: "redirect"; targetNodeId: string }
+  | { action: "abort";    reason: string }
+
+export interface Hook {
+  name:         string
+  description?: string
+  events:       HookEventName[]
+  parallel?:    boolean    // default: true
+  priority?:    number     // default: 50, 0 = highest
+  timeout?:     number     // default: 30000 ms
+  handler:      (event: HookEvent) => Promise<HookDirective>
+}
+
+export type HookIndex = Map<HookEventName, Hook[]>
 
 // ─── TMUX ─────────────────────────────────────────────────────────────────────
 
@@ -171,6 +244,160 @@ async function loadProvider(name: string): Promise<ProviderInvoke> {
   return invoke
 }
 
+// ─── HOOK SYSTEM ─────────────────────────────────────────────────────────────
+
+const VALID_EVENTS = new Set<HookEventName>([
+  "RunStart", "RunEnd", "PreAgent", "PostAgent", "Paused", "Resumed",
+  "ForkStart", "ForkJoin", "GuardrailFail", "SubworkflowStart", "SubworkflowEnd", "Error",
+])
+
+const DIRECTIVE_RANK: Record<string, number> = {
+  abort: 5, pause: 4, redirect: 3, skip: 2, continue: 1,
+}
+
+const DIRECTIVE_SUPPORT: Record<string, Set<HookEventName>> = {
+  abort:    new Set(VALID_EVENTS),
+  pause:    new Set(["PreAgent", "PostAgent", "GuardrailFail", "SubworkflowStart"]),
+  redirect: new Set(["PreAgent", "PostAgent"]),
+  skip:     new Set(["PreAgent"]),
+  continue: new Set(VALID_EVENTS),
+}
+
+function bootstrapLog(runDir: string, msg: string): void {
+  const line = `[${new Date().toISOString().slice(11, 19)}] BOOT    ${"hooks".padEnd(22)} ${msg}`
+  appendFileSync(join(runDir, "orchestrator.log"), line + "\n")
+  process.stdout.write(line + "\n")
+}
+
+async function loadHooks(runDir: string): Promise<HookIndex> {
+  const index: HookIndex = new Map()
+  for (const name of VALID_EVENTS) index.set(name, [])
+
+  const dirs = [join(BUILTIN_DIR, "hooks"), join(USER_DIR, "hooks")]
+  const loaded: string[] = []
+
+  for (const dir of dirs) {
+    if (!existsSync(dir)) continue
+    const files = readdirSync(dir).filter((f: string) => f.endsWith(".ts") || f.endsWith(".js"))
+
+    for (const file of files) {
+      const path = join(dir, file)
+      try {
+        const mod = await import(path)
+        const h = mod.hook ?? mod.default?.hook
+        if (!h || typeof h.handler !== "function" || !h.name || !Array.isArray(h.events) || h.events.length === 0) {
+          bootstrapLog(runDir, `WARN: skipping ${file} — invalid hook export`)
+          continue
+        }
+
+        const hook: Hook = {
+          name:     h.name,
+          description: h.description,
+          events:   h.events.filter((e: string) => VALID_EVENTS.has(e as HookEventName)) as HookEventName[],
+          parallel: h.parallel ?? true,
+          priority: h.priority ?? 50,
+          timeout:  h.timeout ?? 30000,
+          handler:  h.handler,
+        }
+
+        if (hook.events.length === 0) {
+          bootstrapLog(runDir, `WARN: skipping ${file} — no valid events`)
+          continue
+        }
+
+        for (const evt of hook.events) {
+          index.get(evt)!.push(hook)
+        }
+        loaded.push(`${hook.name} (${hook.events.join(", ")})`)
+      } catch (err) {
+        bootstrapLog(runDir, `WARN: failed to load ${file}: ${err}`)
+      }
+    }
+  }
+
+  for (const hooks of index.values()) {
+    hooks.sort((a, b) => (a.priority ?? 50) - (b.priority ?? 50))
+  }
+
+  if (loaded.length > 0) bootstrapLog(runDir, `loaded: ${loaded.join(", ")}`)
+  else bootstrapLog(runDir, "no hooks found")
+
+  return index
+}
+
+async function emitHook(
+  event: HookEventName,
+  payload: Record<string, unknown>,
+  state: RunState,
+): Promise<HookDirective> {
+  const hooks = state.hooks.get(event)
+  if (!hooks || hooks.length === 0) return { action: "continue" }
+
+  const isMutable = event === "PreAgent" || event === "PostAgent"
+  const eventObj = {
+    event,
+    runId:     state.runId,
+    runDir:    state.runDir,
+    context:   isMutable ? state.context : Object.freeze({ ...state.context }),
+    timestamp: Date.now(),
+    ...payload,
+  } as HookEvent
+
+  const directives: Array<{ directive: HookDirective; priority: number }> = []
+
+  const runOne = async (hook: Hook): Promise<void> => {
+    try {
+      const result = await Promise.race([
+        hook.handler(eventObj),
+        new Promise<HookDirective>((_, rej) => setTimeout(() => rej(new Error("timeout")), hook.timeout ?? 30000)),
+      ])
+
+      if (result.action !== "continue") {
+        const supported = DIRECTIVE_SUPPORT[result.action]
+        if (!supported?.has(event)) {
+          process.stderr.write(`HOOK-WARN ${hook.name}: "${result.action}" not supported for ${event}, treating as continue\n`)
+          directives.push({ directive: { action: "continue" }, priority: hook.priority ?? 50 })
+        } else if (result.action === "redirect") {
+          const rd = result as { action: "redirect"; targetNodeId: string }
+          const valid = state.graph.nodes.some(n => n.id === rd.targetNodeId)
+          if (!valid) {
+            process.stderr.write(`HOOK-WARN ${hook.name}: redirect target "${rd.targetNodeId}" not found, treating as continue\n`)
+            directives.push({ directive: { action: "continue" }, priority: hook.priority ?? 50 })
+          } else {
+            directives.push({ directive: result, priority: hook.priority ?? 50 })
+          }
+        } else {
+          directives.push({ directive: result, priority: hook.priority ?? 50 })
+        }
+      } else {
+        directives.push({ directive: result, priority: hook.priority ?? 50 })
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      process.stderr.write(`HOOK-ERR ${hook.name} ${event}: ${msg}\n`)
+      try { appendFileSync(join(state.runDir, "orchestrator.log"), `HOOK-ERR ${hook.name} ${event}: ${msg}\n`) } catch {}
+      directives.push({ directive: { action: "continue" }, priority: hook.priority ?? 50 })
+    }
+  }
+
+  const sequential = hooks.filter(h => h.parallel === false)
+  for (const hook of sequential) await runOne(hook)
+
+  const parallel = hooks.filter(h => h.parallel !== false)
+  if (parallel.length > 0) await Promise.all(parallel.map(runOne))
+
+  let winner: { directive: HookDirective; priority: number } = { directive: { action: "continue" }, priority: 100 }
+  for (const d of directives) {
+    const dRank = DIRECTIVE_RANK[d.directive.action] ?? 1
+    const wRank = DIRECTIVE_RANK[winner.directive.action] ?? 1
+    if (dRank > wRank || (dRank === wRank && d.priority < winner.priority)) {
+      winner = d
+    }
+  }
+
+  return winner.directive
+}
+
 // ─── AGENT INVOCATION ─────────────────────────────────────────────────────────
 
 async function invokeAgent(node: GraphNode, state: RunState): Promise<AgentResult> {
@@ -219,63 +446,68 @@ function runGuardrails(
   return { pass: true }
 }
 
-function writePause(state: RunState, nodeId: string, fromNodeId: string | null, reason?: string): void {
-  const { runDir, context, log } = state
+async function writePause(state: RunState, nodeId: string, fromNodeId: string | null, reason?: string): Promise<void> {
+  const { runDir, context } = state
+  const stateFile = join(runDir, "state.json")
   const paused: PausedState = {
     runId: state.runId, nodeId: fromNodeId ?? nodeId, context,
     agentOutput: context[fromNodeId ?? ""] ?? "", reason,
   }
-  writeFileSync(join(runDir, "state.json"), JSON.stringify(paused, null, 2))
+  writeFileSync(stateFile, JSON.stringify(paused, null, 2))
   writeFileSync(join(runDir, "context.json"), JSON.stringify(context, null, 2))
-  if (reason) log("GUARD", nodeId, reason)
-  log("PAUSED", nodeId, `state → ${join(runDir, "state.json")}`)
-  log("PAUSED", nodeId, `resume: supertinker resume --run ${state.runId} --choice <label> --workflow <path>`)
+  await emitHook("Paused", { nodeId, reason, stateFile }, state)
 }
 
 // ─── ORCHESTRATOR CORE ────────────────────────────────────────────────────────
 
 async function executeNode(nodeId: string, fromNodeId: string | null, state: RunState): Promise<void> {
-  const { graph, context, joinMap, runDir, log } = state
+  const { graph, context, joinMap, runDir } = state
   const node = graph.nodes.find(n => n.id === nodeId)
   if (!node) throw new Error(`Node not found: "${nodeId}"`)
 
   // ── Terminals ────────────────────────────────────────────────────────────
-  if (node.type === "done")   { log("DONE", "graph", "✓ completed"); return }
-  if (node.type === "failed") { log("FAILED", "graph", "✗ failed"); throw new Error("Graph reached failed terminal") }
-  if (node.type === "paused") { writePause(state, nodeId, fromNodeId); return }
+  if (node.type === "done")   { await emitHook("RunEnd", { terminal: "done", finalContext: context }, state); return }
+  if (node.type === "failed") { await emitHook("RunEnd", { terminal: "failed", finalContext: context }, state); throw new Error("Graph reached failed terminal") }
+  if (node.type === "paused") { await writePause(state, nodeId, fromNodeId); return }
 
   // ── Fork ─────────────────────────────────────────────────────────────────
   if (node.type === "fork") {
-    log("FORK", nodeId, `→ [${node.targets!.join(", ")}]`)
+    const directive = await emitHook("ForkStart", { nodeId, targets: node.targets! }, state)
+    if (directive.action === "abort") throw new Error(`Aborted by hook: ${(directive as { reason: string }).reason}`)
     await Promise.all(node.targets!.map(t => executeNode(t, nodeId, state)))
+    await emitHook("ForkJoin", { nodeId, joinedFrom: node.targets! }, state)
     return
   }
 
   // ── Join ─────────────────────────────────────────────────────────────────
   if (node.type === "join") {
     if (!joinMap.has(nodeId)) joinMap.set(nodeId, new Set())
-    const done = joinMap.get(nodeId)!
-    if (fromNodeId) done.add(fromNodeId)
-    log("JOIN", nodeId, `${done.size}/${node.waits_for!.length} complete`)
-    if (done.size < node.waits_for!.length) return
+    const arrived = joinMap.get(nodeId)!
+    if (fromNodeId) arrived.add(fromNodeId)
+    if (arrived.size < node.waits_for!.length) return
   }
 
   // ── Subworkflow ──────────────────────────────────────────────────────────
   if (node.type === "subworkflow") {
     const raw = context[node.source!]
-    if (!raw) { log("ERROR", nodeId, `source "${node.source}" not in context`); return executeNode(node.fallback ?? graph.fallback, nodeId, state) }
+    if (!raw) {
+      await emitHook("Error", { nodeId, error: `source "${node.source}" not in context`, fallbackNodeId: node.fallback ?? graph.fallback }, state)
+      return executeNode(node.fallback ?? graph.fallback, nodeId, state)
+    }
 
     let inner: Workflow
     try { inner = JSON.parse(raw) }
-    catch (err) { log("ERROR", nodeId, `bad workflow JSON: ${err}`); return executeNode(node.fallback ?? graph.fallback, nodeId, state) }
+    catch (err) {
+      await emitHook("Error", { nodeId, error: `bad workflow JSON: ${err}`, fallbackNodeId: node.fallback ?? graph.fallback }, state)
+      return executeNode(node.fallback ?? graph.fallback, nodeId, state)
+    }
 
     // Save as reusable .workflow.ts
     const importPath = resolve("supertinker.ts").replace(/\.ts$/, "")
     const tsContent = `import type { Workflow } from "${importPath}";\n\nexport const workflow: Workflow = ${JSON.stringify(inner, null, 2)};\n`
     const workflowFile = join(runDir, `${inner.id}.workflow.ts`)
     writeFileSync(workflowFile, tsContent)
-    log("SUBWORK", nodeId, `saved → ${workflowFile}`)
-    log("SUBWORK", nodeId, `executing "${inner.id}" (${inner.graph.nodes.length} nodes)`)
+    await emitHook("SubworkflowStart", { nodeId, innerWorkflow: inner }, state)
 
     const innerRunDir = join(runDir, `sub-${inner.id}`)
     mkdirSync(innerRunDir, { recursive: true })
@@ -296,11 +528,14 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
         pre:  [...(state.guardrails.pre ?? []),  ...(inner.guardrails?.pre ?? [])],
         post: [...(state.guardrails.post ?? []), ...(inner.guardrails?.post ?? [])],
       },
-      log: makeLogger(join(innerRunDir, "orchestrator.log")),
+      hooks: state.hooks,
     }
 
     try { await executeNode(inner.graph.start, null, innerState) }
-    catch (err) { log("ERROR", nodeId, `subworkflow failed: ${err}`); return executeNode(node.fallback ?? graph.fallback, nodeId, state) }
+    catch (err) {
+      await emitHook("Error", { nodeId, error: String(err), fallbackNodeId: node.fallback ?? graph.fallback }, state)
+      return executeNode(node.fallback ?? graph.fallback, nodeId, state)
+    }
 
     context[nodeId] = JSON.stringify(innerState.context)
     writeFileSync(join(runDir, "context.json"), JSON.stringify(context, null, 2))
@@ -308,8 +543,7 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
     // Save to library
     const libDir = join(USER_DIR, "workflows"); mkdirSync(libDir, { recursive: true })
     copyFileSync(workflowFile, join(libDir, `${inner.id}.workflow.ts`))
-    log("SUBWORK", nodeId, `library → ${join(libDir, `${inner.id}.workflow.ts`)}`)
-    log("SUBWORK", nodeId, `completed`)
+    await emitHook("SubworkflowEnd", { nodeId, innerContext: innerState.context }, state)
 
     const next = node.options?.["done"]
     if (next) return executeNode(next, nodeId, state)
@@ -326,32 +560,62 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
 
   if (guardrails.pre?.length) {
     const pre = runGuardrails(guardrails.pre, { context, nodeId })
-    if (!pre.pass) return writePause(state, nodeId, fromNodeId, `pre-guardrail: ${pre.reason}`)
+    if (!pre.pass) {
+      await emitHook("GuardrailFail", { nodeId, phase: "pre" as const, reason: pre.reason }, state)
+      return writePause(state, nodeId, fromNodeId, `pre-guardrail: ${pre.reason}`)
+    }
   }
 
-  log("START", nodeId, `agent: ${node.agent}`)
+  const preDirective = await emitHook("PreAgent", {
+    nodeId, agent: node.agent!,
+    userPrompt: renderUserPrompt(sliceContext(context, node.slice), node.instruction),
+    systemPrompt: buildSystemPrompt(state.registry, node),
+    slicedContext: sliceContext(context, node.slice),
+  }, state)
+
+  if (preDirective.action === "abort") throw new Error(`Aborted by hook: ${(preDirective as { reason: string }).reason}`)
+  if (preDirective.action === "skip") return executeNode(node.fallback ?? graph.fallback, nodeId, state)
+  if (preDirective.action === "pause") return writePause(state, nodeId, fromNodeId, (preDirective as { reason: string }).reason)
+  if (preDirective.action === "redirect") return executeNode((preDirective as { targetNodeId: string }).targetNodeId, nodeId, state)
 
   let result: AgentResult
   try { result = await invokeAgent(node, state) }
-  catch (err) { log("ERROR", nodeId, String(err)); return executeNode(node.fallback ?? graph.fallback, nodeId, state) }
+  catch (err) {
+    await emitHook("Error", { nodeId, error: String(err), fallbackNodeId: node.fallback ?? graph.fallback }, state)
+    return executeNode(node.fallback ?? graph.fallback, nodeId, state)
+  }
+
+  const postDirective = await emitHook("PostAgent", {
+    nodeId, agent: node.agent!,
+    result, transcriptPath: result.transcriptPath,
+  }, state)
+
+  if (postDirective.action === "abort") throw new Error(`Aborted by hook: ${(postDirective as { reason: string }).reason}`)
+  if (postDirective.action === "pause") return writePause(state, nodeId, fromNodeId, (postDirective as { reason: string }).reason)
+  if (postDirective.action === "redirect") return executeNode((postDirective as { targetNodeId: string }).targetNodeId, nodeId, state)
 
   // Post-guardrails — retry once, then pause
   if (guardrails.post?.length) {
     const post = runGuardrails(guardrails.post, { context, nodeId, output: result.output, choice: result.choice })
     if (!post.pass) {
-      log("GUARD", nodeId, `${post.reason} — retrying`)
+      await emitHook("GuardrailFail", { nodeId, phase: "post" as const, reason: post.reason }, state)
       const retryNode = { ...node, instruction: `${node.instruction ?? ""}\n\nGUARDRAIL FEEDBACK: ${post.reason}\nFix the issue and try again.` }
       try { result = await invokeAgent(retryNode, state) }
       catch (err) { return writePause(state, nodeId, fromNodeId, `post-guardrail: ${post.reason} (retry failed)`) }
       const post2 = runGuardrails(guardrails.post, { context, nodeId, output: result.output, choice: result.choice })
-      if (!post2.pass) return writePause(state, nodeId, fromNodeId, `post-guardrail: ${post2.reason} (after retry)`)
+      if (!post2.pass) {
+        await emitHook("GuardrailFail", { nodeId, phase: "post" as const, reason: post2.reason }, state)
+        return writePause(state, nodeId, fromNodeId, `post-guardrail: ${post2.reason} (after retry)`)
+      }
     }
   }
 
   const nextNodeId = node.options?.[result.choice]
-  if (!nextNodeId) { log("INVALID", nodeId, `choice "${result.choice}" not declared`); return executeNode(node.fallback ?? graph.fallback, nodeId, state) }
+  if (!nextNodeId) {
+    await emitHook("Error", { nodeId, error: `choice "${result.choice}" not declared`, fallbackNodeId: node.fallback ?? graph.fallback }, state)
+    return executeNode(node.fallback ?? graph.fallback, nodeId, state)
+  }
 
-  log("CHOICE", nodeId, `→ ${result.choice} → ${nextNodeId}`)
   context[nodeId] = result.output
   writeFileSync(join(runDir, "context.json"), JSON.stringify(context, null, 2))
   return executeNode(nextNodeId, nodeId, state)
@@ -393,18 +657,20 @@ export async function run({ workflow, initialContext = {} }: { workflow: Workflo
   const runDir = join("/tmp/orchestrator", runId)
   mkdirSync(runDir, { recursive: true })
 
-  const log = makeLogger(join(runDir, "orchestrator.log"))
+  const hooks = await loadHooks(runDir)
+
   tmux("new-window", "orch-log", `tail -f ${join(runDir, "orchestrator.log")}`)
 
-  log("RUN", runId, workflow.description)
-  log("RUN", runId, `graph: ${graph.id}  nodes: ${graph.nodes.length}  dir: ${runDir}`)
+  const state: RunState = {
+    runId, runDir, context: { ...initialContext }, joinMap: new Map(),
+    iterationCounts: new Map(), graph, registry, guardrails: workflow.guardrails ?? {}, hooks,
+  }
+
+  await emitHook("RunStart", { workflow, initialContext }, state)
 
   validateTemplateVariables(graph, initialContext)
 
-  await executeNode(graph.start, null, {
-    runId, runDir, context: { ...initialContext }, joinMap: new Map(),
-    iterationCounts: new Map(), graph, registry, guardrails: workflow.guardrails ?? {}, log,
-  })
+  await executeNode(graph.start, null, state)
 }
 
 export async function resume({ workflow, runId, choice }: { workflow: Workflow; runId: string; choice: string }): Promise<void> {
@@ -413,16 +679,18 @@ export async function resume({ workflow, runId, choice }: { workflow: Workflow; 
   if (!existsSync(join(runDir, "state.json"))) throw new Error(`No paused state: ${runDir}/state.json`)
 
   const paused: PausedState = JSON.parse(readFileSync(join(runDir, "state.json"), "utf8"))
-  const log = makeLogger(join(runDir, "orchestrator.log"))
+  const hooks = await loadHooks(runDir)
   const fromNode = graph.nodes.find(n => n.id === paused.nodeId)
   if (!fromNode?.options?.[choice]) throw new Error(`Choice "${choice}" not valid for "${paused.nodeId}". Options: ${Object.keys(fromNode?.options ?? {})}`)
 
-  log("RESUME", runId, `node: ${paused.nodeId}  choice: ${choice}`)
-
-  await executeNode(fromNode.options[choice], paused.nodeId, {
+  const state: RunState = {
     runId, runDir, context: paused.context, joinMap: new Map(),
-    iterationCounts: new Map(), graph, registry, guardrails: workflow.guardrails ?? {}, log,
-  })
+    iterationCounts: new Map(), graph, registry, guardrails: workflow.guardrails ?? {}, hooks,
+  }
+
+  await emitHook("Resumed", { nodeId: paused.nodeId, choice }, state)
+
+  await executeNode(fromNode.options[choice], paused.nodeId, state)
 }
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
