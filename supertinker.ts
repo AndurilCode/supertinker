@@ -143,8 +143,8 @@ export interface HookEventBase {
 interface HookEventMap {
   RunStart:         { workflow: Workflow; initialContext: Context }
   RunEnd:           { terminal: "done" | "failed"; finalContext: Context }
-  PreAgent:         { nodeId: string; agent: string; userPrompt: string; systemPrompt: string; slicedContext: Context }
-  PostAgent:        { nodeId: string; agent: string; result: AgentResult; transcriptPath?: string }
+  PreAgent:         { nodeId: string; agent: string; provider: string; userPrompt: string; systemPrompt: string; slicedContext: Context }
+  PostAgent:        { nodeId: string; agent: string; provider: string; result: AgentResult; transcriptPath?: string }
   PreProvider:      { nodeId: string; agent: string; provider: string; userPrompt: string; systemPrompt: string; cwd: string; model?: string }
   Paused:           { nodeId: string; reason?: string; stateFile: string }
   Resumed:          { nodeId: string; choice: string }
@@ -611,14 +611,15 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
   const userPrompt = renderUserPrompt(sliced, node.instruction)
   const sysPrompt  = buildSystemPrompt(state.registry, node)
 
+  const def = state.registry[node.agent!]
+
   const preDirective = await emitHook("PreAgent", {
-    nodeId, agent: node.agent!,
+    nodeId, agent: node.agent!, provider: def.command,
     userPrompt, systemPrompt: sysPrompt, slicedContext: sliced,
   }, state)
 
   if (await applyDirective(preDirective, state, nodeId, node, fromNodeId)) return
 
-  const def = state.registry[node.agent!]
   const preProviderDirective = await emitHook("PreProvider", {
     nodeId, agent: node.agent!, provider: def.command,
     userPrompt, systemPrompt: sysPrompt, cwd: resolve(node.cwd ?? process.cwd()), model: def.model,
@@ -630,7 +631,7 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
   catch (err) { return errorFallback(state, nodeId, node, String(err)) }
 
   const postDirective = await emitHook("PostAgent", {
-    nodeId, agent: node.agent!, result, transcriptPath: result.transcriptPath,
+    nodeId, agent: node.agent!, provider: def.command, result, transcriptPath: result.transcriptPath,
   }, state)
 
   if (await applyDirective(postDirective, state, nodeId, node, fromNodeId)) return
