@@ -10,7 +10,7 @@
  */
 
 import { appendFileSync, existsSync, mkdirSync, readdirSync,
-         readFileSync, writeFileSync, copyFileSync }            from "fs"
+         readFileSync, writeFileSync }                          from "fs"
 import { spawn, spawnSync }                                     from "child_process"
 import { join, resolve }                                        from "path"
 import { homedir }                                              from "os"
@@ -79,6 +79,7 @@ export interface StorageAdapter {
   pauseExists(runDir: string): Promise<boolean>
   appendLog(runDir: string, line: string): Promise<void>
   saveFile(runDir: string, name: string, content: string): Promise<void>
+  saveWorkflow(id: string, content: string): Promise<void> // persist generated workflow to library
   logPath(runDir: string, nodeId: string): string          // returns path for provider logFile
 }
 
@@ -111,6 +112,11 @@ export const filesystemStorage: StorageAdapter = {
   },
   async saveFile(runDir, name, content) {
     writeFileSync(join(runDir, name), content)
+  },
+  async saveWorkflow(id, content) {
+    const dir = join(USER_DIR, "workflows")
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, `${id}.workflow.ts`), content)
   },
 }
 
@@ -581,8 +587,7 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
     context[nodeId] = JSON.stringify(innerState.context)
     await saveContext(state)
 
-    const libDir = join(USER_DIR, "workflows"); mkdirSync(libDir, { recursive: true })
-    copyFileSync(join(runDir, workflowFile), join(libDir, `${inner.id}.workflow.ts`))
+    await state.storage.saveWorkflow(inner.id, readFileSync(join(runDir, workflowFile), "utf8"))
     await emitHook("SubworkflowEnd", { nodeId, innerContext: innerState.context }, state)
 
     const next = node.options?.["done"]
