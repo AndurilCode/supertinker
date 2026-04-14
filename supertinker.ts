@@ -561,8 +561,9 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
   if (guardrails.pre?.length) {
     const pre = runGuardrails(guardrails.pre, { context, nodeId })
     if (!pre.pass) {
-      await emitHook("GuardrailFail", { nodeId, phase: "pre" as const, reason: pre.reason }, state)
-      return writePause(state, nodeId, fromNodeId, `pre-guardrail: ${pre.reason}`)
+      const reason = (pre as { reason: string }).reason
+      await emitHook("GuardrailFail", { nodeId, phase: "pre" as const, reason }, state)
+      return writePause(state, nodeId, fromNodeId, `pre-guardrail: ${reason}`)
     }
   }
 
@@ -598,14 +599,16 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
   if (guardrails.post?.length) {
     const post = runGuardrails(guardrails.post, { context, nodeId, output: result.output, choice: result.choice })
     if (!post.pass) {
-      await emitHook("GuardrailFail", { nodeId, phase: "post" as const, reason: post.reason }, state)
-      const retryNode = { ...node, instruction: `${node.instruction ?? ""}\n\nGUARDRAIL FEEDBACK: ${post.reason}\nFix the issue and try again.` }
+      const postReason = (post as { reason: string }).reason
+      await emitHook("GuardrailFail", { nodeId, phase: "post" as const, reason: postReason }, state)
+      const retryNode = { ...node, instruction: `${node.instruction ?? ""}\n\nGUARDRAIL FEEDBACK: ${postReason}\nFix the issue and try again.` }
       try { result = await invokeAgent(retryNode, state) }
-      catch (err) { return writePause(state, nodeId, fromNodeId, `post-guardrail: ${post.reason} (retry failed)`) }
+      catch (err) { return writePause(state, nodeId, fromNodeId, `post-guardrail: ${postReason} (retry failed)`) }
       const post2 = runGuardrails(guardrails.post, { context, nodeId, output: result.output, choice: result.choice })
       if (!post2.pass) {
-        await emitHook("GuardrailFail", { nodeId, phase: "post" as const, reason: post2.reason }, state)
-        return writePause(state, nodeId, fromNodeId, `post-guardrail: ${post2.reason} (after retry)`)
+        const post2Reason = (post2 as { reason: string }).reason
+        await emitHook("GuardrailFail", { nodeId, phase: "post" as const, reason: post2Reason }, state)
+        return writePause(state, nodeId, fromNodeId, `post-guardrail: ${post2Reason} (after retry)`)
       }
     }
   }

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.js
+*.d.ts
+*.js.map
+!workflows/*.js
+!providers/*.js
+!hooks/*.js
+.DS_Store
+*.tsbuildinfo

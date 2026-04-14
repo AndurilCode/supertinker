@@ -1,0 +1,9 @@
+{
+  "name": "supertinker",
+  "version": "1.0.0",
+  "description": "A minimal agent orchestrator",
+  "type": "module",
+  "devDependencies": {
+    "@types/node": "^25.6.0"
+  }
+}
