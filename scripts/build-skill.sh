@@ -42,7 +42,7 @@ import { existsSync, mkdirSync, writeFileSync, readFileSync } from \"fs\"
 import { join, resolve } from \"path\"
 import { homedir } from \"os\"
 import { run, resume, buildCatalog, resolveWorkflow } from \"${REPO_ROOT}/supertinker.ts\"
-import type { Context } from \"${REPO_ROOT}/supertinker.ts\"
+import type { Context, ProviderOverrides } from \"${REPO_ROOT}/supertinker.ts\"
 
 // ── Embedded built-in files ──
 const EMBEDDED: Record<string, string> = \${embedded}
@@ -72,22 +72,27 @@ async function main() {
   if (cmd === \"run\") {
     const workflowRef = get(\"--workflow\") ?? \"meta\"
     const prompt = get(\"--prompt\")
+    const provider = get(\"--provider\")
+    const model = get(\"--model\")
+    const overrides: ProviderOverrides = { ...(provider && { provider }), ...(model && { model }) }
     const workflowPath = resolveWorkflow(workflowRef) ?? resolve(workflowRef)
     const { workflow } = await import(workflowPath)
     const initialContext: Context = { catalog: buildCatalog(), cwd: process.cwd() }
     if (prompt) initialContext.task = prompt
-    await run({ workflow, initialContext })
+    await run({ workflow, initialContext, overrides })
     return
   }
 
   if (cmd === \"resume\") {
     const runId = get(\"--run\"), choice = get(\"--choice\"), workflowRef = get(\"--workflow\")
+    const provider = get(\"--provider\"), model = get(\"--model\")
+    const overrides: ProviderOverrides = { ...(provider && { provider }), ...(model && { model }) }
     if (!runId || !choice || !workflowRef) {
       console.error(\"Usage: supertinker resume --run <id> --choice <label> --workflow <name|path>\")
       process.exit(1)
     }
     const { workflow } = await import(resolveWorkflow(workflowRef) ?? resolve(workflowRef))
-    await resume({ workflow, runId, choice })
+    await resume({ workflow, runId, choice, overrides })
     return
   }
 
@@ -99,13 +104,18 @@ async function main() {
   console.log(\\\`supertinker — minimal agent orchestrator
 
 Commands:
-  run     [--workflow <name|path>] --prompt <text>   (default: meta)
-  resume  --run <runId> --choice <label> --workflow <name|path>
+  run     [--workflow <name|path>] --prompt <text> [--provider <name>] [--model <name>]
+  resume  --run <runId> --choice <label> --workflow <name|path> [--provider <name>] [--model <name>]
   list    show available workflows
+
+Options:
+  --provider   Override provider for all agents (e.g. copilot, claude)
+  --model      Override model for all agents (e.g. opus, gpt-4o)
 
 Examples:
   supertinker run --prompt \"Build a REST API\"
-  supertinker run --workflow meta --prompt \"Build a REST API\"
+  supertinker run --prompt \"Build a REST API\" --provider copilot --model gpt-4o
+  supertinker run --prompt \"Build a REST API\" --model opus
   supertinker list\\\`)
 }
 

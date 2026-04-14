@@ -120,11 +120,15 @@ export const filesystemStorage: StorageAdapter = {
   },
 }
 
+export interface ProviderOverrides {
+  provider?: string; model?: string
+}
+
 interface RunState {
   runId: string; runDir: string; context: Context
   joinMap: Map<string, Set<string>>; iterationCounts: Map<string, number>
   graph: Graph; registry: AgentRegistry; guardrails: Guardrails; hooks: HookIndex
-  storage: StorageAdapter
+  storage: StorageAdapter; overrides: ProviderOverrides
 }
 
 // ─── HOOKS
@@ -444,6 +448,8 @@ async function invokeAgent(
   precomputed?: { userPrompt: string; systemPrompt: string },
 ): Promise<AgentResult> {
   const def        = state.registry[node.agent!]
+  const command    = state.overrides.provider ?? def.command
+  const model      = state.overrides.model ?? def.model
   const userPrompt = precomputed?.userPrompt  ?? renderUserPrompt(sliceContext(state.context, node.slice), node.instruction)
   const sysPrompt  = precomputed?.systemPrompt ?? buildSystemPrompt(state.registry, node)
   const cwd        = resolve(node.cwd ?? process.cwd())
@@ -451,8 +457,8 @@ async function invokeAgent(
 
   tmux("new-window", `node-${node.id}`, `tail -f ${logFile}`)
   try {
-    const invoke = await loadProvider(def.command)
-    return await invoke({ userPrompt, systemPrompt: sysPrompt, options: Object.keys(node.options ?? {}), cwd, model: def.model, logFile })
+    const invoke = await loadProvider(command)
+    return await invoke({ userPrompt, systemPrompt: sysPrompt, options: Object.keys(node.options ?? {}), cwd, model, logFile })
   } finally {
     setTimeout(() => tmux("kill-window", `node-${node.id}`), 800)
   }
@@ -577,6 +583,7 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
         pre:  [...(state.guardrails.pre ?? []),  ...(inner.guardrails?.pre ?? [])],
         post: [...(state.guardrails.post ?? []), ...(inner.guardrails?.post ?? [])],
       },
+      overrides: state.overrides,
       hooks: state.hooks,
       storage: state.storage,
     }
@@ -617,17 +624,19 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
   const sysPrompt  = buildSystemPrompt(state.registry, node)
 
   const def = state.registry[node.agent!]
+  const command = state.overrides.provider ?? def.command
+  const model   = state.overrides.model ?? def.model
 
   const preDirective = await emitHook("PreAgent", {
-    nodeId, agent: node.agent!, provider: def.command,
+    nodeId, agent: node.agent!, provider: command,
     userPrompt, systemPrompt: sysPrompt, slicedContext: sliced,
   }, state)
 
   if (await applyDirective(preDirective, state, nodeId, node, fromNodeId)) return
 
   const preProviderDirective = await emitHook("PreProvider", {
-    nodeId, agent: node.agent!, provider: def.command,
-    userPrompt, systemPrompt: sysPrompt, cwd: resolve(node.cwd ?? process.cwd()), model: def.model,
+    nodeId, agent: node.agent!, provider: command,
+    userPrompt, systemPrompt: sysPrompt, cwd: resolve(node.cwd ?? process.cwd()), model,
   }, state)
   if (await applyDirective(preProviderDirective, state, nodeId, node, fromNodeId)) return
 
@@ -636,7 +645,7 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
   catch (err) { return errorFallback(state, nodeId, node, String(err)) }
 
   const postDirective = await emitHook("PostAgent", {
-    nodeId, agent: node.agent!, provider: def.command, result, transcriptPath: result.transcriptPath,
+    nodeId, agent: node.agent!, provider: command, result, transcriptPath: result.transcriptPath,
   }, state)
 
   if (await applyDirective(postDirective, state, nodeId, node, fromNodeId)) return
@@ -703,7 +712,7 @@ export function resolveWorkflow(name: string): string | null {
 
 // ─── PUBLIC API
 
-export async function run({ workflow, initialContext = {} }: { workflow: Workflow; initialContext?: Context }): Promise<void> {
+export async function run({ workflow, initialContext = {}, overrides = {} }: { workflow: Workflow; initialContext?: Context; overrides?: ProviderOverrides }): Promise<void> {
   const { graph, registry } = workflow
   const storage = await loadStorage()
   const runId  = `${workflow.id}-${Date.now()}`
@@ -715,7 +724,7 @@ export async function run({ workflow, initialContext = {} }: { workflow: Workflo
 
   const state: RunState = {
     runId, runDir, context: { ...initialContext }, joinMap: new Map(),
-    iterationCounts: new Map(), graph, registry, guardrails: workflow.guardrails ?? {}, hooks, storage,
+    iterationCounts: new Map(), graph, registry, guardrails: workflow.guardrails ?? {}, hooks, storage, overrides,
   }
 
   await emitHook("RunStart", { workflow, initialContext }, state)
@@ -725,7 +734,7 @@ export async function run({ workflow, initialContext = {} }: { workflow: Workflo
   await executeNode(graph.start, null, state)
 }
 
-export async function resume({ workflow, runId, choice }: { workflow: Workflow; runId: string; choice: string }): Promise<void> {
+export async function resume({ workflow, runId, choice, overrides = {} }: { workflow: Workflow; runId: string; choice: string; overrides?: ProviderOverrides }): Promise<void> {
   const { graph, registry } = workflow
   const storage = await loadStorage()
   const runDir = join("/tmp/orchestrator", runId)
@@ -738,7 +747,7 @@ export async function resume({ workflow, runId, choice }: { workflow: Workflow; 
 
   const state: RunState = {
     runId, runDir, context: paused.context, joinMap: new Map(),
-    iterationCounts: new Map(), graph, registry, guardrails: workflow.guardrails ?? {}, hooks, storage,
+    iterationCounts: new Map(), graph, registry, guardrails: workflow.guardrails ?? {}, hooks, storage, overrides,
   }
 
   await emitHook("Resumed", { nodeId: paused.nodeId, choice }, state)
@@ -756,19 +765,24 @@ async function cli(): Promise<void> {
   if (cmd === "run") {
     const workflowRef  = get("--workflow") ?? "meta"
     const prompt       = get("--prompt")
+    const provider     = get("--provider")
+    const model        = get("--model")
+    const overrides: ProviderOverrides = { ...(provider && { provider }), ...(model && { model }) }
     const workflowPath = resolveWorkflow(workflowRef) ?? resolve(workflowRef)
     const { workflow } = await import(workflowPath)
     const initialContext: Context = { catalog: buildCatalog(), cwd: process.cwd() }
     if (prompt) initialContext.task = prompt
-    await run({ workflow, initialContext })
+    await run({ workflow, initialContext, overrides })
     return
   }
 
   if (cmd === "resume") {
     const runId = get("--run"), choice = get("--choice"), workflowRef = get("--workflow")
+    const provider = get("--provider"), model = get("--model")
+    const overrides: ProviderOverrides = { ...(provider && { provider }), ...(model && { model }) }
     if (!runId || !choice || !workflowRef) { console.error("Usage: supertinker resume --run <id> --choice <label> --workflow <name|path>"); process.exit(1) }
     const { workflow } = await import(resolveWorkflow(workflowRef) ?? resolve(workflowRef))
-    await resume({ workflow, runId, choice })
+    await resume({ workflow, runId, choice, overrides })
     return
   }
 

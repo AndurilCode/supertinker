@@ -13,8 +13,11 @@ ST=bun\ ${CLAUDE_SKILL_DIR}/scripts/supertinker.mjs
 
 $ST run --prompt "task"                              # default meta-workflow
 $ST run --workflow <name|path> --prompt "task"        # named workflow
+$ST run --prompt "task" --provider copilot --model gpt-4o  # override provider/model
+$ST run --prompt "task" --model opus                 # override model only
 $ST list                                             # available workflows
 $ST resume --run <runId> --choice <label> --workflow <name>  # resume paused
+$ST resume --run <runId> --choice <label> --workflow <name> --provider copilot  # resume with override
 ```
 
 ## Monitoring

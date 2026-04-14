@@ -313,14 +313,16 @@ async function emitHook(event, payload, state) {
 }
 async function invokeAgent(node, state, precomputed) {
   const def = state.registry[node.agent];
+  const command = state.overrides.provider ?? def.command;
+  const model = state.overrides.model ?? def.model;
   const userPrompt = precomputed?.userPrompt ?? renderUserPrompt(sliceContext(state.context, node.slice), node.instruction);
   const sysPrompt = precomputed?.systemPrompt ?? buildSystemPrompt(state.registry, node);
   const cwd = resolve(node.cwd ?? process.cwd());
   const logFile = state.storage.logPath(state.runDir, node.id);
   tmux("new-window", `node-${node.id}`, `tail -f ${logFile}`);
   try {
-    const invoke = await loadProvider(def.command);
-    return await invoke({ userPrompt, systemPrompt: sysPrompt, options: Object.keys(node.options ?? {}), cwd, model: def.model, logFile });
+    const invoke = await loadProvider(command);
+    return await invoke({ userPrompt, systemPrompt: sysPrompt, options: Object.keys(node.options ?? {}), cwd, model, logFile });
   } finally {
     setTimeout(() => tmux("kill-window", `node-${node.id}`), 800);
   }
@@ -455,6 +457,7 @@ export const workflow: Workflow = ${JSON.stringify(inner, null, 2)};
         pre: [...state.guardrails.pre ?? [], ...inner.guardrails?.pre ?? []],
         post: [...state.guardrails.post ?? [], ...inner.guardrails?.post ?? []]
       },
+      overrides: state.overrides,
       hooks: state.hooks,
       storage: state.storage
     };
@@ -489,10 +492,12 @@ export const workflow: Workflow = ${JSON.stringify(inner, null, 2)};
   const userPrompt = renderUserPrompt(sliced, node.instruction);
   const sysPrompt = buildSystemPrompt(state.registry, node);
   const def = state.registry[node.agent];
+  const command = state.overrides.provider ?? def.command;
+  const model = state.overrides.model ?? def.model;
   const preDirective = await emitHook("PreAgent", {
     nodeId,
     agent: node.agent,
-    provider: def.command,
+    provider: command,
     userPrompt,
     systemPrompt: sysPrompt,
     slicedContext: sliced
@@ -502,11 +507,11 @@ export const workflow: Workflow = ${JSON.stringify(inner, null, 2)};
   const preProviderDirective = await emitHook("PreProvider", {
     nodeId,
     agent: node.agent,
-    provider: def.command,
+    provider: command,
     userPrompt,
     systemPrompt: sysPrompt,
     cwd: resolve(node.cwd ?? process.cwd()),
-    model: def.model
+    model
   }, state);
   if (await applyDirective(preProviderDirective, state, nodeId, node, fromNodeId))
     return;
@@ -519,7 +524,7 @@ export const workflow: Workflow = ${JSON.stringify(inner, null, 2)};
   const postDirective = await emitHook("PostAgent", {
     nodeId,
     agent: node.agent,
-    provider: def.command,
+    provider: command,
     result,
     transcriptPath: result.transcriptPath
   }, state);
@@ -591,7 +596,7 @@ function resolveWorkflow(name) {
   }
   return null;
 }
-async function run({ workflow, initialContext = {} }) {
+async function run({ workflow, initialContext = {}, overrides = {} }) {
   const { graph, registry } = workflow;
   const storage = await loadStorage();
   const runId = `${workflow.id}-${Date.now()}`;
@@ -608,13 +613,14 @@ async function run({ workflow, initialContext = {} }) {
     registry,
     guardrails: workflow.guardrails ?? {},
     hooks,
-    storage
+    storage,
+    overrides
   };
   await emitHook("RunStart", { workflow, initialContext }, state);
   validateTemplateVariables(graph, initialContext);
   await executeNode(graph.start, null, state);
 }
-async function resume({ workflow, runId, choice }) {
+async function resume({ workflow, runId, choice, overrides = {} }) {
   const { graph, registry } = workflow;
   const storage = await loadStorage();
   const runDir = join("/tmp/orchestrator", runId);
@@ -635,7 +641,8 @@ async function resume({ workflow, runId, choice }) {
     registry,
     guardrails: workflow.guardrails ?? {},
     hooks,
-    storage
+    storage,
+    overrides
   };
   await emitHook("Resumed", { nodeId: paused.nodeId, choice }, state);
   await executeNode(fromNode.options[choice], paused.nodeId, state);
@@ -650,22 +657,27 @@ async function cli() {
   if (cmd === "run") {
     const workflowRef = get("--workflow") ?? "meta";
     const prompt = get("--prompt");
+    const provider = get("--provider");
+    const model = get("--model");
+    const overrides = { ...provider && { provider }, ...model && { model } };
     const workflowPath = resolveWorkflow(workflowRef) ?? resolve(workflowRef);
     const { workflow } = await import(workflowPath);
     const initialContext = { catalog: buildCatalog(), cwd: process.cwd() };
     if (prompt)
       initialContext.task = prompt;
-    await run({ workflow, initialContext });
+    await run({ workflow, initialContext, overrides });
     return;
   }
   if (cmd === "resume") {
     const runId = get("--run"), choice = get("--choice"), workflowRef = get("--workflow");
+    const provider = get("--provider"), model = get("--model");
+    const overrides = { ...provider && { provider }, ...model && { model } };
     if (!runId || !choice || !workflowRef) {
       console.error("Usage: supertinker resume --run <id> --choice <label> --workflow <name|path>");
       process.exit(1);
     }
     const { workflow } = await import(resolveWorkflow(workflowRef) ?? resolve(workflowRef));
-    await resume({ workflow, runId, choice });
+    await resume({ workflow, runId, choice, overrides });
     return;
   }
   if (cmd === "list") {
@@ -1188,7 +1200,7 @@ IMPLEMENTER agents are the #2 bottleneck. Parallelize them:
   }
 }
 ` };
-var BUILD_STAMP = "2026-04-14T22:35:17.866Z";
+var BUILD_STAMP = "2026-04-14T22:56:52.585Z";
 var userDir = join2(homedir2(), ".supertinker");
 var stampFile = join2(userDir, ".builtin-stamp");
 var needsExtract = !existsSync2(stampFile) || readFileSync2(stampFile, "utf8").trim() !== BUILD_STAMP;
@@ -1211,22 +1223,27 @@ async function main() {
   if (cmd === "run") {
     const workflowRef = get("--workflow") ?? "meta";
     const prompt = get("--prompt");
+    const provider = get("--provider");
+    const model = get("--model");
+    const overrides = { ...provider && { provider }, ...model && { model } };
     const workflowPath = resolveWorkflow(workflowRef) ?? resolve2(workflowRef);
     const { workflow } = await import(workflowPath);
     const initialContext = { catalog: buildCatalog(), cwd: process.cwd() };
     if (prompt)
       initialContext.task = prompt;
-    await run({ workflow, initialContext });
+    await run({ workflow, initialContext, overrides });
     return;
   }
   if (cmd === "resume") {
     const runId = get("--run"), choice = get("--choice"), workflowRef = get("--workflow");
+    const provider = get("--provider"), model = get("--model");
+    const overrides = { ...provider && { provider }, ...model && { model } };
     if (!runId || !choice || !workflowRef) {
       console.error("Usage: supertinker resume --run <id> --choice <label> --workflow <name|path>");
       process.exit(1);
     }
     const { workflow } = await import(resolveWorkflow(workflowRef) ?? resolve2(workflowRef));
-    await resume({ workflow, runId, choice });
+    await resume({ workflow, runId, choice, overrides });
     return;
   }
   if (cmd === "list") {
@@ -1236,13 +1253,18 @@ async function main() {
   console.log(`supertinker \u2014 minimal agent orchestrator
 
 Commands:
-  run     [--workflow <name|path>] --prompt <text>   (default: meta)
-  resume  --run <runId> --choice <label> --workflow <name|path>
+  run     [--workflow <name|path>] --prompt <text> [--provider <name>] [--model <name>]
+  resume  --run <runId> --choice <label> --workflow <name|path> [--provider <name>] [--model <name>]
   list    show available workflows
+
+Options:
+  --provider   Override provider for all agents (e.g. copilot, claude)
+  --model      Override model for all agents (e.g. opus, gpt-4o)
 
 Examples:
   supertinker run --prompt "Build a REST API"
-  supertinker run --workflow meta --prompt "Build a REST API"
+  supertinker run --prompt "Build a REST API" --provider copilot --model gpt-4o
+  supertinker run --prompt "Build a REST API" --model opus
   supertinker list`);
 }
 main().catch((err) => {
