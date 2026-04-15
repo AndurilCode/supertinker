@@ -201,22 +201,6 @@ function renderUserPrompt(ctx: Context, instruction?: string): string {
   return instruction ? `${instruction}\n\n${sections}` : sections
 }
 
-function validateTemplateVariables(graph: Graph, initialContext: Context): void {
-  const nodeIds = new Set(graph.nodes.map(n => n.id))
-  const unresolved: Array<{ nodeId: string; variable: string }> = []
-  for (const node of graph.nodes) {
-    if (!node.instruction) continue
-    for (const match of node.instruction.matchAll(/\[(\w[\w-]*)\]/g)) {
-      const variable = match[1]
-      if (!nodeIds.has(variable) && !(variable in initialContext))
-        unresolved.push({ nodeId: node.id, variable })
-    }
-  }
-  if (unresolved.length > 0) {
-    const details = unresolved.map(({ nodeId, variable }) => `  • [${variable}] in node "${nodeId}"`).join("\n")
-    throw new Error(`Workflow "${graph.id}" has unresolved template variables.\nAdd them to initialContext:\n${details}`)
-  }
-}
 
 function resolveFallback(node: GraphNode, graph: Graph): string {
   return node.fallback ?? graph.fallback
@@ -744,8 +728,6 @@ export async function run({ workflow, initialContext = {}, overrides = {} }: { w
   }
 
   await emitHook("RunStart", { workflow, initialContext }, state)
-
-  validateTemplateVariables(graph, initialContext)
 
   await executeNode(graph.start, null, state)
 }
