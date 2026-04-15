@@ -67,7 +67,7 @@ const TYPE_TO_DIR: Record<string, string> = {
 
 const USER_HOME = join(homedir(), ".supertinker")
 const CACHE_DIR = join(USER_HOME, "cache", "supertinker")
-const REPO_URL = "https://github.com/gpavanello/supertinker.git"
+const REPO_URL = "https://github.com/AndurilCode/supertinker.git"
 
 function discoverPlugins(pluginsRoot: string): PluginManifest[] {
   const manifests: PluginManifest[] = []
@@ -113,9 +113,16 @@ function copyPluginFile(src: string, dest: string): void {
   }
 }
 
+// The package's own plugins/ dir — works when installed via npm/npx
+const PKG_DIR = resolve(join(new URL(import.meta.url).pathname, ".."))
+
 function ensureCache(): string {
+  // 1. Check package-local plugins (npm install / npx)
+  if (existsSync(join(PKG_DIR, "plugins"))) return PKG_DIR
+  // 2. Check existing cache
   if (existsSync(join(CACHE_DIR, "plugins"))) return CACHE_DIR
   if (existsSync(CACHE_DIR)) return CACHE_DIR
+  // 3. Clone
   console.log("Cloning supertinker plugin repository...")
   try {
     mkdirSync(join(USER_HOME, "cache"), { recursive: true })

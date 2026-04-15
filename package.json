@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "A minimal agent orchestrator",
   "type": "module",
+  "bin": {
+    "supertinker": "./bin/supertinker.mjs"
+  },
   "scripts": {
     "build:skill": "bash scripts/build-skill.sh"
   },
