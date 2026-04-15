@@ -16,41 +16,63 @@ $ST run --workflow <name|path> --prompt "task"        # named workflow
 $ST run --prompt "task" --provider copilot --model gpt-4o  # override provider/model
 $ST run --prompt "task" --model opus                 # override model only
 $ST list                                             # available workflows
+$ST list --hooks                                     # discovered hooks
+$ST status --run <runId>                             # inspect run state
 $ST resume --run <runId> --choice <label> --workflow <name>  # resume paused
 $ST resume --run <runId> --choice <label> --workflow <name> --provider copilot  # resume with override
 ```
 
 ## Monitoring
 
-Runs are long-lived (minutes per agent node). Artifacts in `/tmp/orchestrator/<runId>/`:
-- `orchestrator.log` — lifecycle events
-- `context.json` — all node outputs
-- `state.json` — pause state + choices (if paused)
-- `<nodeId>.log` — raw agent stdout
+Runs are long-lived (minutes per agent node). Use the `status` command as your primary inspection tool.
 
-Latest run: `ls -td /tmp/orchestrator/*/ | head -1`
-
-### Claude Code — use Monitor
+### Claude Code — use Monitor + status
 
 ```bash
 $ST run --prompt "task" &
 ```
-Then:
+Then monitor with a log tail:
 ```
-Monitor(command: "tail -f $(ls -td /tmp/orchestrator/*/ | head -1)/orchestrator.log")
+Monitor(command: "tail -f $(ls -td /tmp/orchestrator/*/ | head -1)/orchestrator.log | grep --line-buffered -E 'START|CHOICE|PAUSED|DONE|FAILED|ERROR'")
 ```
+
+When the monitor reports completion or pause, inspect the run:
+```bash
+$ST status --run <runId>
+```
+
+The `status` command shows: run status (PAUSED/completed), pause reason, iteration counts, all context keys with size and preview, and the last 10 log lines. **Use `status` instead of manually reading context.json/state.json.**
+
+If paused, present choices to the user, then `$ST resume`.
 
 Log patterns: `START` (agent began), `INVOKE` (provider spawned), `CHOICE → <label>` (edge followed), `PAUSED` (needs human input — shows resume command), `DONE ✓` / `FAILED ✗` (terminal).
 
-On complete/pause: read `context.json`. If paused, present choices to user, then `$ST resume`.
+### Run artifacts
+
+Artifacts in `/tmp/orchestrator/<runId>/`:
+- `orchestrator.log` — human-readable lifecycle events
+- `events.ndjson` — machine-readable event stream (one JSON line per event, includes `duration_ms`, `outputLen`, `promptLen`)
+- `context.json` — all node outputs
+- `state.json` — pause state + iteration counts (if paused)
+- `<nodeId>.log` — raw agent stdout
+
+Query events with `jq`:
+```bash
+# Agent durations
+jq 'select(.event == "PostAgent") | {node: .nodeId, ms: .duration_ms, choice: .choice}' events.ndjson
+# Errors only
+jq 'select(.event == "Error")' events.ndjson
+```
+
+Latest run: `ls -td /tmp/orchestrator/*/ | head -1`
 
 ### Other environments — stop and wait
 
 Launch `$ST run --prompt "task"`, tell the user:
-> Supertinker running. Watch: `tail -f $(ls -td /tmp/orchestrator/*/ | head -1)/orchestrator.log`
+> Supertinker running. Check progress: `$ST status --run <runId>`
 > Let me know when done or paused.
 
-**Do not poll.** Wait for user to report status, then read `context.json` / `state.json`.
+**Do not poll.** Wait for user to report status, then use `$ST status --run <runId>` to inspect.
 
 ## Project-local plugins
 
