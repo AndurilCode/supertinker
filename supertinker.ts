@@ -10,7 +10,7 @@
  */
 
 import { appendFileSync, existsSync, mkdirSync, readdirSync,
-         readFileSync, statSync, writeFileSync }                from "fs"
+         readFileSync, writeFileSync }                          from "fs"
 import { spawnSync }                                             from "child_process"
 import { join, resolve }                                        from "path"
 import { homedir }                                              from "os"
@@ -83,7 +83,14 @@ export interface StorageAdapter {
   saveFile(runDir: string, name: string, content: string): Promise<void>
   saveWorkflow(id: string, content: string): Promise<void> // persist generated workflow to library
   logPath(runDir: string, nodeId: string): string          // returns path for provider logFile
+  resolveWorkflow(name: string): Promise<string | null>
+  listWorkflows(): Promise<Array<{ id: string; description: string; file: string; source: string }>>
 }
+
+const BUILTIN_DIR = resolve(join(new URL(import.meta.url).pathname, ".."))
+const USER_DIR    = join(homedir(), ".supertinker")
+const PROJECT_DIR = join(process.cwd(), ".supertinker")
+const SEARCH_DIRS = [PROJECT_DIR, USER_DIR, BUILTIN_DIR]  // project-local wins
 
 export const filesystemStorage: StorageAdapter = {
   async createRun(runId) {
@@ -119,6 +126,35 @@ export const filesystemStorage: StorageAdapter = {
     const dir = join(USER_DIR, "workflows")
     mkdirSync(dir, { recursive: true })
     writeFileSync(join(dir, `${id}.workflow.ts`), content)
+  },
+  async resolveWorkflow(name) {
+    const file = name.endsWith(".workflow.ts") ? name : `${name}.workflow.ts`
+    for (const base of SEARCH_DIRS) {
+      const p = join(base, "workflows", file)
+      if (existsSync(p)) return p
+    }
+    return null
+  },
+  async listWorkflows() {
+    const entries: Array<{ id: string; description: string; file: string; source: string }> = []
+    const sources: Array<[string, string]> = [
+      [join(PROJECT_DIR, "workflows"), "project"],
+      [join(USER_DIR, "workflows"), "library"],
+      [join(BUILTIN_DIR, "workflows"), "built-in"],
+    ]
+    for (const [dir, source] of sources) {
+      let files: string[]
+      try { files = readdirSync(dir).filter((f: string) => f.endsWith(".workflow.ts")) } catch { continue }
+      for (const file of files) {
+        try {
+          const raw = readFileSync(join(dir, file), "utf8")
+          const id   = raw.match(/(?:"id"|id)\s*:\s*"([^"]+)"/)?.[1] ?? file
+          const description = raw.match(/(?:"description"|description)\s*:\s*"([^"]+)"/)?.[1] ?? "(no description)"
+          entries.push({ id, description, file, source })
+        } catch {}
+      }
+    }
+    return entries
   },
 }
 
@@ -229,10 +265,6 @@ export interface ProviderContext {
 }
 export type ProviderInvoke = (ctx: ProviderContext) => Promise<AgentResult>
 
-const BUILTIN_DIR = resolve(join(new URL(import.meta.url).pathname, ".."))
-const USER_DIR    = join(homedir(), ".supertinker")
-const PROJECT_DIR = join(process.cwd(), ".supertinker")
-const SEARCH_DIRS = [PROJECT_DIR, USER_DIR, BUILTIN_DIR]  // project-local wins
 const providerCache = new Map<string, ProviderInvoke>()
 
 function findFile(name: string, subdir: string, ext: string): string | null {
@@ -256,7 +288,7 @@ async function loadProvider(name: string): Promise<ProviderInvoke> {
   return invoke
 }
 
-async function loadStorage(): Promise<StorageAdapter> {
+export async function loadStorage(): Promise<StorageAdapter> {
   const path = findFile("storage", "storage", "ts|js")
   if (!path) return filesystemStorage
   const mod = await import(path)
@@ -655,61 +687,12 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
 
 // ─── WORKFLOW LIBRARY
 
-let catalogCache: { result: string; mtimeKey: string } | null = null
-
-function catalogMtimeKey(): string {
-  const sources = [
-    join(PROJECT_DIR, "workflows"),
-    join(USER_DIR, "workflows"),
-    join(BUILTIN_DIR, "workflows"),
-  ]
-  const parts: string[] = []
-  for (const dir of sources) {
-    try {
-      const files = readdirSync(dir).filter((f: string) => f.endsWith(".workflow.ts")).sort()
-      for (const file of files) {
-        try { const { mtimeMs } = statSync(join(dir, file)); parts.push(`${file}:${mtimeMs}`) } catch {}
-      }
-    } catch {}
-  }
-  return parts.join("|")
-}
-
-export function buildCatalog(): string {
-  const key = catalogMtimeKey()
-  if (catalogCache && catalogCache.mtimeKey === key) return catalogCache.result
-
-  const entries: string[] = []
-  const sources: Array<[string, string]> = [
-    [join(PROJECT_DIR, "workflows"), "project"],
-    [join(USER_DIR, "workflows"), "library"],
-    [join(BUILTIN_DIR, "workflows"), "built-in"],
-  ]
-  for (const [dir, source] of sources) {
-    let files: string[]
-    try { files = readdirSync(dir).filter((f: string) => f.endsWith(".workflow.ts")) } catch { continue }
-    for (const file of files) {
-      try {
-        const raw = readFileSync(join(dir, file), "utf8")
-        const id   = raw.match(/(?:"id"|id)\s*:\s*"([^"]+)"/)?.[1] ?? file
-        const desc = raw.match(/(?:"description"|description)\s*:\s*"([^"]+)"/)?.[1] ?? "(no description)"
-        const nodes = (raw.match(/(?:"id"|id)\s*:/g) || []).length - 1
-        entries.push(`- ${id}: ${desc} (${nodes} nodes) [${source}: ${file}]`)
-      } catch {}
-    }
-  }
-  const result = entries.length === 0 ? "No workflows available." : `Available workflows (${entries.length}):\n${entries.join("\n")}`
-  catalogCache = { result, mtimeKey: key }
-  return result
-}
-
-export function resolveWorkflow(name: string): string | null {
-  const file = name.endsWith(".workflow.ts") ? name : `${name}.workflow.ts`
-  for (const base of SEARCH_DIRS) {
-    const p = join(base, "workflows", file)
-    if (existsSync(p)) return p
-  }
-  return null
+export async function buildCatalog(storage?: StorageAdapter): Promise<string> {
+  const s = storage ?? await loadStorage()
+  const entries = await s.listWorkflows()
+  if (entries.length === 0) return "No workflows available."
+  const lines = entries.map(e => `- ${e.id}: ${e.description} [${e.source}: ${e.file}]`)
+  return `Available workflows (${entries.length}):\n${lines.join("\n")}`
 }
 
 // ─── PUBLIC API
@@ -773,9 +756,10 @@ async function cli(): Promise<void> {
     const provider     = get("--provider")
     const model        = get("--model")
     const overrides: ProviderOverrides = { ...(provider && { provider }), ...(model && { model }) }
-    const workflowPath = resolveWorkflow(workflowRef) ?? resolve(workflowRef)
+    const storage = await loadStorage()
+    const workflowPath = await storage.resolveWorkflow(workflowRef) ?? resolve(workflowRef)
     const { workflow } = await import(workflowPath)
-    const initialContext: Context = { catalog: buildCatalog(), cwd: process.cwd() }
+    const initialContext: Context = { catalog: await buildCatalog(storage), cwd: process.cwd() }
     if (prompt) initialContext.task = prompt
     await run({ workflow, initialContext, overrides })
     return
@@ -786,7 +770,8 @@ async function cli(): Promise<void> {
     const provider = get("--provider"), model = get("--model")
     const overrides: ProviderOverrides = { ...(provider && { provider }), ...(model && { model }) }
     if (!runId || !choice || !workflowRef) { console.error("Usage: supertinker resume --run <id> --choice <label> --workflow <name|path>"); process.exit(1) }
-    const { workflow } = await import(resolveWorkflow(workflowRef) ?? resolve(workflowRef))
+    const storage = await loadStorage()
+    const { workflow } = await import(await storage.resolveWorkflow(workflowRef) ?? resolve(workflowRef))
     await resume({ workflow, runId, choice, overrides })
     return
   }
@@ -858,7 +843,7 @@ async function cli(): Promise<void> {
       console.log(entries.length === 0 ? "No hooks found." : `Hooks (${entries.length}):\n${entries.join("\n")}`)
       return
     }
-    console.log(buildCatalog())
+    console.log(await buildCatalog())
     return
   }
 
