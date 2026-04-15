@@ -26,10 +26,12 @@ const fs = require('fs');
 const path = require('path');
 
 const files = {
-  'providers/claude.ts':        fs.readFileSync(path.join('${REPO_ROOT}', 'providers/claude.ts'), 'utf8'),
-  'providers/copilot.ts':       fs.readFileSync(path.join('${REPO_ROOT}', 'providers/copilot.ts'), 'utf8'),
-  'hooks/logger.ts':            fs.readFileSync(path.join('${REPO_ROOT}', 'hooks/logger.ts'), 'utf8'),
-  'workflows/meta.workflow.ts': fs.readFileSync(path.join('${REPO_ROOT}', 'workflows/meta.workflow.ts'), 'utf8'),
+  'providers/claude.ts':             fs.readFileSync(path.join('${REPO_ROOT}', 'providers/claude.ts'), 'utf8'),
+  'providers/copilot.ts':            fs.readFileSync(path.join('${REPO_ROOT}', 'providers/copilot.ts'), 'utf8'),
+  'hooks/logger.ts':                 fs.readFileSync(path.join('${REPO_ROOT}', 'hooks/logger.ts'), 'utf8'),
+  'hooks/tmux-panes.ts':             fs.readFileSync(path.join('${REPO_ROOT}', 'hooks/tmux-panes.ts'), 'utf8'),
+  'hooks/validate-templates.ts':     fs.readFileSync(path.join('${REPO_ROOT}', 'hooks/validate-templates.ts'), 'utf8'),
+  'workflows/meta.workflow.ts':      fs.readFileSync(path.join('${REPO_ROOT}', 'workflows/meta.workflow.ts'), 'utf8'),
 };
 
 const embedded = JSON.stringify(files);
@@ -41,7 +43,7 @@ fs.writeFileSync('${ENTRY}', \`#!/usr/bin/env bun
 import { existsSync, mkdirSync, writeFileSync, readFileSync } from \"fs\"
 import { join, resolve } from \"path\"
 import { homedir } from \"os\"
-import { run, resume, buildCatalog, resolveWorkflow } from \"${REPO_ROOT}/supertinker.ts\"
+import { run, resume, buildCatalog, loadStorage } from \"${REPO_ROOT}/supertinker.ts\"
 import type { Context, ProviderOverrides } from \"${REPO_ROOT}/supertinker.ts\"
 
 // ── Embedded built-in files ──
@@ -75,9 +77,10 @@ async function main() {
     const provider = get(\"--provider\")
     const model = get(\"--model\")
     const overrides: ProviderOverrides = { ...(provider && { provider }), ...(model && { model }) }
-    const workflowPath = resolveWorkflow(workflowRef) ?? resolve(workflowRef)
+    const storage = await loadStorage()
+    const workflowPath = await storage.resolveWorkflow(workflowRef) ?? resolve(workflowRef)
     const { workflow } = await import(workflowPath)
-    const initialContext: Context = { catalog: buildCatalog(), cwd: process.cwd() }
+    const initialContext: Context = { catalog: await buildCatalog(storage), cwd: process.cwd() }
     if (prompt) initialContext.task = prompt
     await run({ workflow, initialContext, overrides })
     return
@@ -91,13 +94,14 @@ async function main() {
       console.error(\"Usage: supertinker resume --run <id> --choice <label> --workflow <name|path>\")
       process.exit(1)
     }
-    const { workflow } = await import(resolveWorkflow(workflowRef) ?? resolve(workflowRef))
+    const storage = await loadStorage()
+    const { workflow } = await import(await storage.resolveWorkflow(workflowRef) ?? resolve(workflowRef))
     await resume({ workflow, runId, choice, overrides })
     return
   }
 
   if (cmd === \"list\") {
-    console.log(buildCatalog())
+    console.log(await buildCatalog())
     return
   }
 
