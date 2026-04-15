@@ -96,13 +96,12 @@ function saveInstalled(targetDir: string, data: InstalledJson): void {
   writeFileSync(join(targetDir, "installed.json"), JSON.stringify(data, null, 2))
 }
 
-function copyPluginFile(src: string, dest: string, scope: "global" | "local"): void {
+function copyPluginFile(src: string, dest: string): void {
   if (src.endsWith(".ts")) {
+    // Strip type-only imports that reference supertinker.ts — they're erased at
+    // runtime by tsx/bun and the path won't resolve in arbitrary project dirs.
     let content = readFileSync(src, "utf8")
-    const supertinkerRef = scope === "local"
-      ? "../../supertinker.js"
-      : "../cache/supertinker/supertinker.js"
-    content = content.replace(/from\s+["']\.\.\/\.\.\/\.\.\/supertinker(?:\.js)?["']/g, `from "${supertinkerRef}"`)
+    content = content.replace(/^import\s+type\s+\{[^}]*\}\s+from\s+["'][^"']*supertinker[^"']*["']\s*;?\s*$/gm, "")
     writeFileSync(dest, content)
   } else {
     copyFileSync(src, dest)
@@ -331,7 +330,7 @@ async function installPlugins(names: string[], scope: "global" | "local"): Promi
     mkdirSync(destDir, { recursive: true })
 
     for (const file of manifest.files) {
-      copyPluginFile(join(sourceDir, file), join(destDir, file), scope)
+      copyPluginFile(join(sourceDir, file), join(destDir, file))
     }
 
     installed.plugins.push({
@@ -414,7 +413,7 @@ function pluginsUpdate(): void {
     const destDir = join(USER_HOME, TYPE_TO_DIR[manifest.type])
     mkdirSync(destDir, { recursive: true })
     for (const file of manifest.files) {
-      copyPluginFile(join(sourceDir, file), join(destDir, file), "global")
+      copyPluginFile(join(sourceDir, file), join(destDir, file))
     }
     const changed = entry.version !== manifest.version
     if (changed) {
@@ -436,7 +435,7 @@ function pluginsUpdate(): void {
     const destDir = join(localDir, TYPE_TO_DIR[manifest.type])
     mkdirSync(destDir, { recursive: true })
     for (const file of manifest.files) {
-      copyPluginFile(join(sourceDir, file), join(destDir, file), "local")
+      copyPluginFile(join(sourceDir, file), join(destDir, file))
     }
     const changed = entry.version !== manifest.version
     if (changed) {
