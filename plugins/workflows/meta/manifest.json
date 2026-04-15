@@ -1,0 +1,7 @@
+{
+  "name": "meta",
+  "type": "workflow",
+  "description": "Architect agent designs a workflow, then the orchestrator executes it",
+  "files": ["meta.workflow.ts"],
+  "version": "1.0.0"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "tmux-panes",
+  "type": "hook",
+  "description": "Opens tmux panes for orchestrator log and per-agent log tailing",
+  "files": ["tmux-panes.ts"],
+  "version": "1.0.0"
+}

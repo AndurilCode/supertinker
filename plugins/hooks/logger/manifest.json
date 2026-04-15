@@ -1,0 +1,7 @@
+{
+  "name": "logger",
+  "type": "hook",
+  "description": "Structured logging to orchestrator.log and stdout for all lifecycle events",
+  "files": ["logger.ts"],
+  "version": "1.0.0"
+}

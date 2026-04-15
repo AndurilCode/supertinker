@@ -1,0 +1,7 @@
+{
+  "name": "fork-worktree",
+  "type": "hook",
+  "description": "Isolates fork branches in git worktrees — parallel agents work in separate repo copies",
+  "files": ["fork-worktree.ts"],
+  "version": "1.0.0"
+}

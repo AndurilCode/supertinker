@@ -1,0 +1,7 @@
+{
+  "name": "events",
+  "type": "hook",
+  "description": "NDJSON event stream — writes machine-readable JSON lines to events.ndjson",
+  "files": ["events.ts"],
+  "version": "1.0.0"
+}

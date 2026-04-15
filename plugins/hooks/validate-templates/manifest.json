@@ -1,0 +1,7 @@
+{
+  "name": "validate-templates",
+  "type": "hook",
+  "description": "Aborts run if workflow instructions reference undefined template variables",
+  "files": ["validate-templates.ts"],
+  "version": "1.0.0"
+}

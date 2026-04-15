@@ -1,0 +1,7 @@
+{
+  "name": "copilot",
+  "type": "provider",
+  "description": "GitHub Copilot CLI provider with sentinel-based choice parsing",
+  "files": ["copilot.ts"],
+  "version": "1.0.0"
+}

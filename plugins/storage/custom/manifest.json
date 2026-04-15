@@ -1,0 +1,7 @@
+{
+  "name": "custom",
+  "type": "storage",
+  "description": "Project-local workflow persistence — saves generated workflows to .supertinker/workflows/",
+  "files": ["storage.ts"],
+  "version": "1.0.0"
+}
