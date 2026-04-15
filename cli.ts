@@ -96,6 +96,19 @@ function saveInstalled(targetDir: string, data: InstalledJson): void {
   writeFileSync(join(targetDir, "installed.json"), JSON.stringify(data, null, 2))
 }
 
+function copyPluginFile(src: string, dest: string, scope: "global" | "local"): void {
+  if (src.endsWith(".ts")) {
+    let content = readFileSync(src, "utf8")
+    const supertinkerRef = scope === "local"
+      ? "../../supertinker.js"
+      : "../cache/supertinker/supertinker.js"
+    content = content.replace(/from\s+["']\.\.\/\.\.\/\.\.\/supertinker(?:\.js)?["']/g, `from "${supertinkerRef}"`)
+    writeFileSync(dest, content)
+  } else {
+    copyFileSync(src, dest)
+  }
+}
+
 function ensureCache(): string {
   if (existsSync(join(CACHE_DIR, "plugins"))) return CACHE_DIR
   if (existsSync(CACHE_DIR)) return CACHE_DIR
@@ -318,7 +331,7 @@ async function installPlugins(names: string[], scope: "global" | "local"): Promi
     mkdirSync(destDir, { recursive: true })
 
     for (const file of manifest.files) {
-      copyFileSync(join(sourceDir, file), join(destDir, file))
+      copyPluginFile(join(sourceDir, file), join(destDir, file), scope)
     }
 
     installed.plugins.push({
@@ -401,7 +414,7 @@ function pluginsUpdate(): void {
     const destDir = join(USER_HOME, TYPE_TO_DIR[manifest.type])
     mkdirSync(destDir, { recursive: true })
     for (const file of manifest.files) {
-      copyFileSync(join(sourceDir, file), join(destDir, file))
+      copyPluginFile(join(sourceDir, file), join(destDir, file), "global")
     }
     const changed = entry.version !== manifest.version
     if (changed) {
@@ -423,7 +436,7 @@ function pluginsUpdate(): void {
     const destDir = join(localDir, TYPE_TO_DIR[manifest.type])
     mkdirSync(destDir, { recursive: true })
     for (const file of manifest.files) {
-      copyFileSync(join(sourceDir, file), join(destDir, file))
+      copyPluginFile(join(sourceDir, file), join(destDir, file), "local")
     }
     const changed = entry.version !== manifest.version
     if (changed) {
