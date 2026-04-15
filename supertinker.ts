@@ -157,7 +157,7 @@ interface HookEventMap {
   RunEnd:           { terminal: "done" | "failed"; finalContext: Context }
   PreAgent:         { nodeId: string; agent: string; provider: string; userPrompt: string; systemPrompt: string; slicedContext: Context }
   PostAgent:        { nodeId: string; agent: string; provider: string; result: AgentResult; transcriptPath?: string }
-  PreProvider:      { nodeId: string; agent: string; provider: string; userPrompt: string; systemPrompt: string; cwd: string; model?: string }
+  PreProvider:      { nodeId: string; agent: string; provider: string; userPrompt: string; systemPrompt: string; cwd: string; model?: string; logFile: string }
   Paused:           { nodeId: string; reason?: string; stateFile: string }
   Resumed:          { nodeId: string; choice: string }
   ForkStart:        { nodeId: string; targets: string[] }
@@ -625,9 +625,11 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
 
   if (await applyDirective(preDirective, state, nodeId, node, fromNodeId)) return
 
+  const logFile = state.storage.logPath(state.runDir, node.id)
   const preProviderDirective = await emitHook("PreProvider", {
     nodeId, agent: node.agent!, provider: command,
     userPrompt, systemPrompt: sysPrompt, cwd: resolve(node.cwd ?? process.cwd()), model,
+    logFile,
   }, state)
   if (await applyDirective(preProviderDirective, state, nodeId, node, fromNodeId)) return
 

@@ -16,7 +16,7 @@ function tmux(action: "new-window" | "kill-window", name: string, cmd?: string):
 export const hook: Hook = {
   name: "tmux-panes",
   description: "Opens tmux panes for orchestrator log and per-agent log tailing",
-  events: ["RunStart", "PreProvider", "PostAgent"],
+  events: ["RunStart", "PreProvider", "PostAgent", "Error"],
   parallel: true,
   priority: 90,
 
@@ -28,12 +28,16 @@ export const hook: Hook = {
       }
       case "PreProvider": {
         const e = event as Extract<HookEvent, { event: "PreProvider" }>
-        const logFile = join(event.runDir, `${e.nodeId}.log`)
-        tmux("new-window", `node-${e.nodeId}`, `tail -f ${logFile}`)
+        tmux("new-window", `node-${e.nodeId}`, `tail -f ${e.logFile}`)
         break
       }
       case "PostAgent": {
         const e = event as Extract<HookEvent, { event: "PostAgent" }>
+        setTimeout(() => tmux("kill-window", `node-${e.nodeId}`), 800)
+        break
+      }
+      case "Error": {
+        const e = event as Extract<HookEvent, { event: "Error" }>
         setTimeout(() => tmux("kill-window", `node-${e.nodeId}`), 800)
         break
       }
