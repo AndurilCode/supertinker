@@ -13,13 +13,15 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
-  statSync,
   writeFileSync
 } from "fs";
-import { spawn, spawnSync } from "child_process";
 import { join, resolve } from "path";
 import { homedir } from "os";
 import { createRequire } from "module";
+var BUILTIN_DIR = resolve(join(new URL(import.meta.url).pathname, ".."));
+var USER_DIR = join(homedir(), ".supertinker");
+var PROJECT_DIR = join(process.cwd(), ".supertinker");
+var SEARCH_DIRS = [PROJECT_DIR, USER_DIR, BUILTIN_DIR];
 var filesystemStorage = {
   async createRun(runId) {
     const dir = join("/tmp/orchestrator", runId);
@@ -55,20 +57,42 @@ var filesystemStorage = {
     const dir = join(USER_DIR, "workflows");
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, `${id}.workflow.ts`), content);
+  },
+  async resolveWorkflow(name) {
+    const file = name.endsWith(".workflow.ts") ? name : `${name}.workflow.ts`;
+    for (const base of SEARCH_DIRS) {
+      const p = join(base, "workflows", file);
+      if (existsSync(p))
+        return p;
+    }
+    return null;
+  },
+  async listWorkflows() {
+    const entries = [];
+    const sources = [
+      [join(PROJECT_DIR, "workflows"), "project"],
+      [join(USER_DIR, "workflows"), "library"],
+      [join(BUILTIN_DIR, "workflows"), "built-in"]
+    ];
+    for (const [dir, source] of sources) {
+      let files;
+      try {
+        files = readdirSync(dir).filter((f) => f.endsWith(".workflow.ts"));
+      } catch {
+        continue;
+      }
+      for (const file of files) {
+        try {
+          const raw = readFileSync(join(dir, file), "utf8");
+          const id = raw.match(/(?:"id"|id)\s*:\s*"([^"]+)"/)?.[1] ?? file;
+          const description = raw.match(/(?:"description"|description)\s*:\s*"([^"]+)"/)?.[1] ?? "(no description)";
+          entries.push({ id, description, file, source });
+        } catch {}
+      }
+    }
+    return entries;
   }
 };
-function tmuxRunning() {
-  return !!process.env.TMUX;
-}
-function tmux(action, name, cmd) {
-  if (!tmuxRunning())
-    return;
-  try {
-    const safe = name.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 20);
-    const args = action === "new-window" ? [action, "-n", safe, cmd] : [action, "-t", safe];
-    spawn("tmux", args, { detached: true, stdio: "ignore" }).unref();
-  } catch {}
-}
 function sliceContext(ctx, keys) {
   if (!keys)
     return ctx;
@@ -82,26 +106,6 @@ ${v}`).join(`
   return instruction ? `${instruction}
 
 ${sections}` : sections;
-}
-function validateTemplateVariables(graph, initialContext) {
-  const nodeIds = new Set(graph.nodes.map((n) => n.id));
-  const unresolved = [];
-  for (const node of graph.nodes) {
-    if (!node.instruction)
-      continue;
-    for (const match of node.instruction.matchAll(/\[(\w[\w-]*)\]/g)) {
-      const variable = match[1];
-      if (!nodeIds.has(variable) && !(variable in initialContext))
-        unresolved.push({ nodeId: node.id, variable });
-    }
-  }
-  if (unresolved.length > 0) {
-    const details = unresolved.map(({ nodeId, variable }) => `  • [${variable}] in node "${nodeId}"`).join(`
-`);
-    throw new Error(`Workflow "${graph.id}" has unresolved template variables.
-Add them to initialContext:
-${details}`);
-  }
 }
 function resolveFallback(node, graph) {
   return node.fallback ?? graph.fallback;
@@ -124,10 +128,6 @@ Do not invent options. Do not omit the sentinel block.` : undefined;
 
 `);
 }
-var BUILTIN_DIR = resolve(join(new URL(import.meta.url).pathname, ".."));
-var USER_DIR = join(homedir(), ".supertinker");
-var PROJECT_DIR = join(process.cwd(), ".supertinker");
-var SEARCH_DIRS = [PROJECT_DIR, USER_DIR, BUILTIN_DIR];
 var providerCache = new Map;
 function findFile(name, subdir, ext) {
   for (const base of SEARCH_DIRS) {
@@ -321,17 +321,12 @@ async function invokeAgent(node, state, precomputed) {
   const cwd = resolve(state.context[`_worktree:${node.id}`] ?? node.cwd ?? process.cwd());
   const logFile = state.storage.logPath(state.runDir, node.id);
   const agentTimeout = node.timeout ?? 600000;
-  tmux("new-window", `node-${node.id}`, `tail -f ${logFile}`);
-  try {
-    const invoke = await loadProvider(command);
-    const result = await Promise.race([
-      invoke({ userPrompt, systemPrompt: sysPrompt, options: Object.keys(node.options ?? {}), cwd, model, logFile }),
-      new Promise((_, rej) => setTimeout(() => rej(new Error(`Agent timeout after ${agentTimeout}ms on node "${node.id}"`)), agentTimeout))
-    ]);
-    return result;
-  } finally {
-    setTimeout(() => tmux("kill-window", `node-${node.id}`), 800);
-  }
+  const invoke = await loadProvider(command);
+  const result = await Promise.race([
+    invoke({ userPrompt, systemPrompt: sysPrompt, options: Object.keys(node.options ?? {}), cwd, model, logFile }),
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`Agent timeout after ${agentTimeout}ms on node "${node.id}"`)), agentTimeout))
+  ]);
+  return result;
 }
 function evalGuardrail(g, ctx) {
   if (typeof g === "function")
@@ -511,6 +506,7 @@ export const workflow: Workflow = ${JSON.stringify(inner, null, 2)};
   }, state);
   if (await applyDirective(preDirective, state, nodeId, node, fromNodeId))
     return;
+  const logFile = state.storage.logPath(state.runDir, node.id);
   const preProviderDirective = await emitHook("PreProvider", {
     nodeId,
     agent: node.agent,
@@ -518,7 +514,8 @@ export const workflow: Workflow = ${JSON.stringify(inner, null, 2)};
     userPrompt,
     systemPrompt: sysPrompt,
     cwd: resolve(node.cwd ?? process.cwd()),
-    model
+    model,
+    logFile
   }, state);
   if (await applyDirective(preProviderDirective, state, nodeId, node, fromNodeId))
     return;
@@ -566,68 +563,15 @@ Fix the issue and try again.` };
   await saveContext(state);
   return executeNode(nextNodeId, nodeId, state);
 }
-var catalogCache = null;
-function catalogMtimeKey() {
-  const sources = [
-    join(PROJECT_DIR, "workflows"),
-    join(USER_DIR, "workflows"),
-    join(BUILTIN_DIR, "workflows")
-  ];
-  const parts = [];
-  for (const dir of sources) {
-    try {
-      const files = readdirSync(dir).filter((f) => f.endsWith(".workflow.ts")).sort();
-      for (const file of files) {
-        try {
-          const { mtimeMs } = statSync(join(dir, file));
-          parts.push(`${file}:${mtimeMs}`);
-        } catch {}
-      }
-    } catch {}
-  }
-  return parts.join("|");
-}
-function buildCatalog() {
-  const key = catalogMtimeKey();
-  if (catalogCache && catalogCache.mtimeKey === key)
-    return catalogCache.result;
-  const entries = [];
-  const sources = [
-    [join(PROJECT_DIR, "workflows"), "project"],
-    [join(USER_DIR, "workflows"), "library"],
-    [join(BUILTIN_DIR, "workflows"), "built-in"]
-  ];
-  for (const [dir, source] of sources) {
-    let files;
-    try {
-      files = readdirSync(dir).filter((f) => f.endsWith(".workflow.ts"));
-    } catch {
-      continue;
-    }
-    for (const file of files) {
-      try {
-        const raw = readFileSync(join(dir, file), "utf8");
-        const id = raw.match(/(?:"id"|id)\s*:\s*"([^"]+)"/)?.[1] ?? file;
-        const desc = raw.match(/(?:"description"|description)\s*:\s*"([^"]+)"/)?.[1] ?? "(no description)";
-        const nodes = (raw.match(/(?:"id"|id)\s*:/g) || []).length - 1;
-        entries.push(`- ${id}: ${desc} (${nodes} nodes) [${source}: ${file}]`);
-      } catch {}
-    }
-  }
-  const result = entries.length === 0 ? "No workflows available." : `Available workflows (${entries.length}):
-${entries.join(`
+async function buildCatalog(storage) {
+  const s = storage ?? await loadStorage();
+  const entries = await s.listWorkflows();
+  if (entries.length === 0)
+    return "No workflows available.";
+  const lines = entries.map((e) => `- ${e.id}: ${e.description} [${e.source}: ${e.file}]`);
+  return `Available workflows (${entries.length}):
+${lines.join(`
 `)}`;
-  catalogCache = { result, mtimeKey: key };
-  return result;
-}
-function resolveWorkflow(name) {
-  const file = name.endsWith(".workflow.ts") ? name : `${name}.workflow.ts`;
-  for (const base of SEARCH_DIRS) {
-    const p = join(base, "workflows", file);
-    if (existsSync(p))
-      return p;
-  }
-  return null;
 }
 async function run({ workflow, initialContext = {}, overrides = {} }) {
   const { graph, registry } = workflow;
@@ -635,7 +579,6 @@ async function run({ workflow, initialContext = {}, overrides = {} }) {
   const runId = `${workflow.id}-${Date.now()}`;
   const runDir = await storage.createRun(runId);
   const hooks = await loadHooks(runDir);
-  tmux("new-window", "orch-log", `tail -f ${join(runDir, "orchestrator.log")}`);
   const state = {
     runId,
     runDir,
@@ -649,8 +592,10 @@ async function run({ workflow, initialContext = {}, overrides = {} }) {
     storage,
     overrides
   };
-  await emitHook("RunStart", { workflow, initialContext }, state);
-  validateTemplateVariables(graph, initialContext);
+  const startDirective = await emitHook("RunStart", { workflow, initialContext }, state);
+  if (startDirective.action === "abort") {
+    throw new Error(`Aborted by hook: ${startDirective.reason}`);
+  }
   await executeNode(graph.start, null, state);
 }
 async function resume({ workflow, runId, choice, overrides = {} }) {
@@ -678,165 +623,11 @@ async function resume({ workflow, runId, choice, overrides = {} }) {
     storage,
     overrides
   };
-  await emitHook("Resumed", { nodeId: paused.nodeId, choice }, state);
+  const resumeDirective = await emitHook("Resumed", { nodeId: paused.nodeId, choice }, state);
+  if (resumeDirective.action === "abort") {
+    throw new Error(`Aborted by hook: ${resumeDirective.reason}`);
+  }
   await executeNode(fromNode.options[choice], paused.nodeId, state);
-}
-async function cli() {
-  const argv = process.argv.slice(2);
-  const cmd = argv[0];
-  const get = (flag) => {
-    const i = argv.indexOf(flag);
-    return i >= 0 ? argv[i + 1] : undefined;
-  };
-  if (cmd === "run") {
-    const workflowRef = get("--workflow") ?? "meta";
-    const prompt = get("--prompt");
-    const provider = get("--provider");
-    const model = get("--model");
-    const overrides = { ...provider && { provider }, ...model && { model } };
-    const workflowPath = resolveWorkflow(workflowRef) ?? resolve(workflowRef);
-    const { workflow } = await import(workflowPath);
-    const initialContext = { catalog: buildCatalog(), cwd: process.cwd() };
-    if (prompt)
-      initialContext.task = prompt;
-    await run({ workflow, initialContext, overrides });
-    return;
-  }
-  if (cmd === "resume") {
-    const runId = get("--run"), choice = get("--choice"), workflowRef = get("--workflow");
-    const provider = get("--provider"), model = get("--model");
-    const overrides = { ...provider && { provider }, ...model && { model } };
-    if (!runId || !choice || !workflowRef) {
-      console.error("Usage: supertinker resume --run <id> --choice <label> --workflow <name|path>");
-      process.exit(1);
-    }
-    const { workflow } = await import(resolveWorkflow(workflowRef) ?? resolve(workflowRef));
-    await resume({ workflow, runId, choice, overrides });
-    return;
-  }
-  if (cmd === "status") {
-    const runId = get("--run");
-    if (!runId) {
-      console.error("Usage: supertinker status --run <runId>");
-      process.exit(1);
-    }
-    const runDir = join("/tmp/orchestrator", runId);
-    if (!existsSync(runDir)) {
-      console.error(`Run directory not found: ${runDir}`);
-      process.exit(1);
-    }
-    const ctxPath = join(runDir, "context.json");
-    const statePath = join(runDir, "state.json");
-    const hasPause = existsSync(statePath);
-    const hasContext = existsSync(ctxPath);
-    console.log(`
-  Run: ${runId}`);
-    console.log(`  Dir: ${runDir}`);
-    console.log(`  Status: ${hasPause ? "PAUSED" : "completed"}
-`);
-    if (hasPause) {
-      const paused = JSON.parse(readFileSync(statePath, "utf8"));
-      console.log(`  Paused at: ${paused.nodeId}`);
-      if (paused.reason)
-        console.log(`  Reason:    ${paused.reason}`);
-      if (paused.iterationCounts) {
-        const counts = Object.entries(paused.iterationCounts).filter(([, v]) => v > 0);
-        if (counts.length > 0)
-          console.log(`  Iterations: ${counts.map(([k, v]) => `${k}=${v}`).join(", ")}`);
-      }
-      console.log();
-    }
-    if (hasContext) {
-      const ctx = JSON.parse(readFileSync(ctxPath, "utf8"));
-      const keys = Object.keys(ctx);
-      console.log(`  Context keys (${keys.length}):`);
-      for (const key of keys) {
-        const val = ctx[key];
-        const preview = val.length > 120 ? val.slice(0, 120) + "..." : val;
-        console.log(`    [${key}] (${val.length} chars) ${preview.replace(/\n/g, " ")}`);
-      }
-      console.log();
-    }
-    const logPath = join(runDir, "orchestrator.log");
-    if (existsSync(logPath)) {
-      const lines = readFileSync(logPath, "utf8").trim().split(`
-`);
-      const tail = lines.slice(-10);
-      console.log(`  Log (last ${tail.length} of ${lines.length} lines):`);
-      for (const line of tail)
-        console.log(`    ${line}`);
-      console.log();
-    }
-    return;
-  }
-  if (cmd === "list") {
-    const flag = argv[1];
-    if (flag === "--hooks") {
-      const tmpDir = join("/tmp/orchestrator", "hook-list");
-      mkdirSync(tmpDir, { recursive: true });
-      const hooks = await loadHooks(tmpDir);
-      const entries = [];
-      const seen = new Set;
-      for (const [, hookList] of hooks) {
-        for (const h of hookList) {
-          if (seen.has(h.name))
-            continue;
-          seen.add(h.name);
-          entries.push(`- ${h.name}: ${h.description ?? "(no description)"}  events: [${h.events.join(", ")}]  parallel: ${h.parallel}  priority: ${h.priority}`);
-        }
-      }
-      console.log(entries.length === 0 ? "No hooks found." : `Hooks (${entries.length}):
-${entries.join(`
-`)}`);
-      return;
-    }
-    console.log(buildCatalog());
-    return;
-  }
-  console.log(`supertinker — minimal agent orchestrator
-
-Commands:
-  run     [--workflow <name|path>] --prompt <text>   (default: meta)
-  resume  --run <runId> --choice <label> --workflow <name|path>
-  status  --run <runId>   inspect a run's state and context
-  list           show available workflows
-  list --hooks   show discovered hooks
-
-Examples:
-  tsx supertinker.ts run --prompt "Build a REST API"
-  tsx supertinker.ts run --workflow meta --prompt "Build a REST API"
-  tsx supertinker.ts status --run meta-1234567890
-  tsx supertinker.ts list`);
-}
-function ensureTmux() {
-  if (tmuxRunning())
-    return true;
-  const args = process.argv.slice(1).map((a) => `'${a}'`).join(" ");
-  const sess = `supertinker-${Date.now()}`;
-  try {
-    spawnSync("tmux", ["new-session", "-d", "-s", sess, `${process.argv[0]} ${args}`], { stdio: "ignore" });
-    console.log(`supertinker running in tmux session: ${sess}`);
-    console.log(`  attach:  tmux attach -t ${sess}`);
-    console.log(`  kill:    tmux kill-session -t ${sess}`);
-    return false;
-  } catch {
-    console.log("(tmux not available — running without panes)");
-    return true;
-  }
-}
-var isMain = process.argv[1]?.endsWith("supertinker.ts") || process.argv[1]?.endsWith("supertinker.js");
-if (isMain) {
-  const cmd = process.argv[2];
-  if (!cmd || cmd === "list" || cmd === "status" || cmd === "help")
-    cli().catch((err) => {
-      console.error(err);
-      process.exit(1);
-    });
-  else if (ensureTmux())
-    cli().catch((err) => {
-      console.error(err);
-      process.exit(1);
-    });
 }
 
 // ../../../../private/tmp/supertinker-entry-XXXX.ts
@@ -1101,6 +892,90 @@ export const hook: Hook = {
     return { action: "continue" }
   },
 }
+`, "hooks/tmux-panes.ts": `import { spawn } from "child_process"
+import { join } from "path"
+import type { Hook, HookEvent, HookDirective } from "../supertinker.js"
+
+function tmuxRunning(): boolean { return !!process.env.TMUX }
+
+function tmux(action: "new-window" | "kill-window", name: string, cmd?: string): void {
+  if (!tmuxRunning()) return
+  try {
+    const safe = name.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 20)
+    const args = action === "new-window" ? [action, "-n", safe, cmd!] : [action, "-t", safe]
+    spawn("tmux", args, { detached: true, stdio: "ignore" }).unref()
+  } catch { /* not in tmux */ }
+}
+
+export const hook: Hook = {
+  name: "tmux-panes",
+  description: "Opens tmux panes for orchestrator log and per-agent log tailing",
+  events: ["RunStart", "PreProvider", "PostAgent", "Error"],
+  parallel: true,
+  priority: 90,
+
+  handler: async (event: HookEvent): Promise<HookDirective> => {
+    switch (event.event) {
+      case "RunStart": {
+        tmux("new-window", "orch-log", \`tail -f \${join(event.runDir, "orchestrator.log")}\`)
+        break
+      }
+      case "PreProvider": {
+        const e = event as Extract<HookEvent, { event: "PreProvider" }>
+        tmux("new-window", \`node-\${e.nodeId}\`, \`tail -f \${e.logFile}\`)
+        break
+      }
+      case "PostAgent": {
+        const e = event as Extract<HookEvent, { event: "PostAgent" }>
+        setTimeout(() => tmux("kill-window", \`node-\${e.nodeId}\`), 800)
+        break
+      }
+      case "Error": {
+        const e = event as Extract<HookEvent, { event: "Error" }>
+        setTimeout(() => tmux("kill-window", \`node-\${e.nodeId}\`), 800)
+        break
+      }
+    }
+    return { action: "continue" }
+  },
+}
+`, "hooks/validate-templates.ts": `import type { Hook, HookEvent, HookDirective } from "../supertinker.js"
+
+export const hook: Hook = {
+  name: "validate-templates",
+  description: "Aborts run if workflow instructions reference undefined template variables",
+  events: ["RunStart"],
+  parallel: false,
+  priority: 0,
+
+  handler: async (event: HookEvent): Promise<HookDirective> => {
+    const e = event as Extract<HookEvent, { event: "RunStart" }>
+    const { graph } = e.workflow
+    const initialContext = e.initialContext
+
+    const nodeIds = new Set(graph.nodes.map(n => n.id))
+    const unresolved: Array<{ nodeId: string; variable: string }> = []
+
+    for (const node of graph.nodes) {
+      if (!node.instruction) continue
+      for (const match of node.instruction.matchAll(/\\[(\\w[\\w-]*)\\]/g)) {
+        const variable = match[1]
+        if (!nodeIds.has(variable) && !(variable in initialContext))
+          unresolved.push({ nodeId: node.id, variable })
+      }
+    }
+
+    if (unresolved.length > 0) {
+      const details = unresolved.map(({ nodeId, variable }) => \`  \u2022 [\${variable}] in node "\${nodeId}"\`).join("\\n")
+      return {
+        action: "abort",
+        reason: \`Workflow "\${graph.id}" has unresolved template variables.\\nAdd them to initialContext:\\n\${details}\`,
+      }
+    }
+
+    return { action: "continue" }
+  },
+}
 `, "workflows/meta.workflow.ts": `import type { Workflow } from "../supertinker"
 
 export const workflow: Workflow = {
@@ -1291,7 +1166,7 @@ IMPLEMENTER agents are the #2 bottleneck. Parallelize them:
   }
 }
 ` };
-var BUILD_STAMP = "2026-04-15T09:56:24.877Z";
+var BUILD_STAMP = "2026-04-15T15:33:27.364Z";
 var userDir = join2(homedir2(), ".supertinker");
 var stampFile = join2(userDir, ".builtin-stamp");
 var needsExtract = !existsSync2(stampFile) || readFileSync2(stampFile, "utf8").trim() !== BUILD_STAMP;
@@ -1317,9 +1192,10 @@ async function main() {
     const provider = get("--provider");
     const model = get("--model");
     const overrides = { ...provider && { provider }, ...model && { model } };
-    const workflowPath = resolveWorkflow(workflowRef) ?? resolve2(workflowRef);
+    const storage = await loadStorage();
+    const workflowPath = await storage.resolveWorkflow(workflowRef) ?? resolve2(workflowRef);
     const { workflow } = await import(workflowPath);
-    const initialContext = { catalog: buildCatalog(), cwd: process.cwd() };
+    const initialContext = { catalog: await buildCatalog(storage), cwd: process.cwd() };
     if (prompt)
       initialContext.task = prompt;
     await run({ workflow, initialContext, overrides });
@@ -1333,12 +1209,13 @@ async function main() {
       console.error("Usage: supertinker resume --run <id> --choice <label> --workflow <name|path>");
       process.exit(1);
     }
-    const { workflow } = await import(resolveWorkflow(workflowRef) ?? resolve2(workflowRef));
+    const storage = await loadStorage();
+    const { workflow } = await import(await storage.resolveWorkflow(workflowRef) ?? resolve2(workflowRef));
     await resume({ workflow, runId, choice, overrides });
     return;
   }
   if (cmd === "list") {
-    console.log(buildCatalog());
+    console.log(await buildCatalog());
     return;
   }
   console.log(`supertinker \u2014 minimal agent orchestrator
