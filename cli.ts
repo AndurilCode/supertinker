@@ -98,10 +98,15 @@ function saveInstalled(targetDir: string, data: InstalledJson): void {
 
 function copyPluginFile(src: string, dest: string): void {
   if (src.endsWith(".ts")) {
-    // Strip type-only imports that reference supertinker.ts — they're erased at
-    // runtime by tsx/bun and the path won't resolve in arbitrary project dirs.
+    // Rewrite type imports to point at the cached supertinker.ts — always exists
+    // at ~/.supertinker/cache/supertinker/ after first plugins command. This gives
+    // IDE type-checking in any repo without depending on a local supertinker.ts.
+    const cachedSupertinker = join(USER_HOME, "cache", "supertinker", "supertinker.js")
     let content = readFileSync(src, "utf8")
-    content = content.replace(/^import\s+type\s+\{[^}]*\}\s+from\s+["'][^"']*supertinker[^"']*["']\s*;?\s*$/gm, "")
+    content = content.replace(
+      /from\s+["'][^"']*supertinker(?:\.js)?["']/g,
+      `from "${cachedSupertinker}"`,
+    )
     writeFileSync(dest, content)
   } else {
     copyFileSync(src, dest)
