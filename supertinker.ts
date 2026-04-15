@@ -727,7 +727,10 @@ export async function run({ workflow, initialContext = {}, overrides = {} }: { w
     iterationCounts: new Map(), graph, registry, guardrails: workflow.guardrails ?? {}, hooks, storage, overrides,
   }
 
-  await emitHook("RunStart", { workflow, initialContext }, state)
+  const startDirective = await emitHook("RunStart", { workflow, initialContext }, state)
+  if (startDirective.action === "abort") {
+    throw new Error(`Aborted by hook: ${(startDirective as { action: "abort"; reason: string }).reason}`)
+  }
 
   await executeNode(graph.start, null, state)
 }
@@ -749,7 +752,10 @@ export async function resume({ workflow, runId, choice, overrides = {} }: { work
     iterationCounts: restoredIterations, graph, registry, guardrails: workflow.guardrails ?? {}, hooks, storage, overrides,
   }
 
-  await emitHook("Resumed", { nodeId: paused.nodeId, choice }, state)
+  const resumeDirective = await emitHook("Resumed", { nodeId: paused.nodeId, choice }, state)
+  if (resumeDirective.action === "abort") {
+    throw new Error(`Aborted by hook: ${(resumeDirective as { action: "abort"; reason: string }).reason}`)
+  }
 
   await executeNode(fromNode.options[choice], paused.nodeId, state)
 }
