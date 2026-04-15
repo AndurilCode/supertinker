@@ -1,6 +1,6 @@
 import { appendFileSync } from "fs"
 import { join } from "path"
-import type { Hook, HookEvent, HookDirective } from "../supertinker.js"
+import type { Hook, HookEvent, HookDirective } from "../../../supertinker.js"
 
 function fmt(level: string, nodeId: string, msg: string): string {
   const ts = new Date().toISOString().slice(11, 19)

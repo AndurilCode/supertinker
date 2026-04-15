@@ -1,7 +1,7 @@
 import { execSync } from "child_process"
 import { existsSync, mkdirSync } from "fs"
 import { join, resolve } from "path"
-import type { Hook, HookEvent, HookDirective, Context } from "../supertinker.js"
+import type { Hook, HookEvent, HookDirective, Context } from "../../../supertinker.js"
 
 /**
  * Fork worktree isolation hook.

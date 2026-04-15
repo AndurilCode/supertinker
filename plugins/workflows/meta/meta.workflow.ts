@@ -1,4 +1,4 @@
-import type { Workflow } from "../supertinker"
+import type { Workflow } from "../../../supertinker"
 
 export const workflow: Workflow = {
   id: "meta-generate-and-run",

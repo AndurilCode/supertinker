@@ -1,6 +1,6 @@
 import { spawn } from "child_process"
 import { join } from "path"
-import type { Hook, HookEvent, HookDirective } from "../supertinker.js"
+import type { Hook, HookEvent, HookDirective } from "../../../supertinker.js"
 
 function tmuxRunning(): boolean { return !!process.env.TMUX }
 

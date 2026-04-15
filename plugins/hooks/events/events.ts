@@ -1,6 +1,6 @@
 import { appendFileSync } from "fs"
 import { join } from "path"
-import type { Hook, HookEvent, HookDirective } from "../supertinker.js"
+import type { Hook, HookEvent, HookDirective } from "../../../supertinker.js"
 
 /**
  * NDJSON event stream hook.

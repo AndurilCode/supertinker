@@ -1,4 +1,4 @@
-import type { Hook, HookEvent, HookDirective } from "../supertinker.js"
+import type { Hook, HookEvent, HookDirective } from "../../../supertinker.js"
 
 export const hook: Hook = {
   name: "validate-templates",
