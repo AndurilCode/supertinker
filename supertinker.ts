@@ -11,7 +11,7 @@
 
 import { appendFileSync, existsSync, mkdirSync, readdirSync,
          readFileSync, statSync, writeFileSync }                from "fs"
-import { spawn, spawnSync }                                     from "child_process"
+import { spawnSync }                                             from "child_process"
 import { join, resolve }                                        from "path"
 import { homedir }                                              from "os"
 import { createRequire }                                        from "module"
@@ -188,19 +188,6 @@ export interface Hook {
 }
 
 export type HookIndex = Map<HookEventName, Hook[]>
-
-// ─── TMUX
-
-function tmuxRunning(): boolean { return !!process.env.TMUX }
-
-function tmux(action: "new-window" | "kill-window", name: string, cmd?: string): void {
-  if (!tmuxRunning()) return
-  try {
-    const safe = name.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 20)
-    const args = action === "new-window" ? [action, "-n", safe, cmd!] : [action, "-t", safe]
-    spawn("tmux", args, { detached: true, stdio: "ignore" }).unref()
-  } catch { /* not in tmux */ }
-}
 
 // ─── CONTEXT
 
@@ -459,17 +446,12 @@ async function invokeAgent(
 
   const agentTimeout = node.timeout ?? 600_000  // default 10 minutes
 
-  tmux("new-window", `node-${node.id}`, `tail -f ${logFile}`)
-  try {
-    const invoke = await loadProvider(command)
-    const result = await Promise.race([
-      invoke({ userPrompt, systemPrompt: sysPrompt, options: Object.keys(node.options ?? {}), cwd, model, logFile }),
-      new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`Agent timeout after ${agentTimeout}ms on node "${node.id}"`)), agentTimeout)),
-    ])
-    return result
-  } finally {
-    setTimeout(() => tmux("kill-window", `node-${node.id}`), 800)
-  }
+  const invoke = await loadProvider(command)
+  const result = await Promise.race([
+    invoke({ userPrompt, systemPrompt: sysPrompt, options: Object.keys(node.options ?? {}), cwd, model, logFile }),
+    new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`Agent timeout after ${agentTimeout}ms on node "${node.id}"`)), agentTimeout)),
+  ])
+  return result
 }
 
 // ─── GUARDRAILS
@@ -754,8 +736,6 @@ export async function run({ workflow, initialContext = {}, overrides = {} }: { w
 
   const hooks = await loadHooks(runDir)
 
-  tmux("new-window", "orch-log", `tail -f ${join(runDir, "orchestrator.log")}`)
-
   const state: RunState = {
     runId, runDir, context: { ...initialContext }, joinMap: new Map(),
     iterationCounts: new Map(), graph, registry, guardrails: workflow.guardrails ?? {}, hooks, storage, overrides,
@@ -911,7 +891,7 @@ Examples:
 // ─── TMUXAUTO-LAUNCH ────────────────────────────────────────────────────────
 
 function ensureTmux(): boolean {
-  if (tmuxRunning()) return true
+  if (!!process.env.TMUX) return true
   const args = process.argv.slice(1).map(a => `'${a}'`).join(" ")
   const sess = `supertinker-${Date.now()}`
   try {
