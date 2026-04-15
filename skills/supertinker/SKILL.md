@@ -1,10 +1,10 @@
 ---
 name: supertinker
-description: Run supertinker agent orchestrator workflows and monitor their execution. Use this skill whenever the user wants to run a multi-agent workflow, orchestrate agents, launch supertinker, check on a supertinker run, resume a paused workflow, or mentions supertinker by name. Also trigger when the user asks to run a DAG of agents, compose agent pipelines, or execute a plan-develop-review cycle.
+description: Run supertinker agent orchestrator workflows and monitor their execution. Use this skill whenever the user wants to run a multi-agent workflow, orchestrate agents, launch supertinker, check on a supertinker run, resume a paused workflow, or mentions supertinker by name. Also trigger when the user asks to search, install, or manage supertinker plugins, hooks, providers, or workflows.
 ---
 
 **Binary**: `bun ${CLAUDE_SKILL_DIR}/scripts/supertinker.mjs` (aliased below as `ST`). Requires `bun` + `tmux`.
-On first run, extracts built-in providers/hooks/workflows to `~/.supertinker/`. Project-local `.supertinker/` overrides built-ins.
+On first run, install plugins with `$ST plugins install`. The only built-in is the Claude Code provider.
 
 ## Commands
 
@@ -74,6 +74,23 @@ Launch `$ST run --prompt "task"`, tell the user:
 
 **Do not poll.** Wait for user to report status, then use `$ST status --run <runId>` to inspect.
 
-## Project-local plugins
+## Plugin Management
 
-Override built-ins via `.supertinker/` in cwd: `providers/<name>.ts`, `hooks/<name>.ts`, `workflows/<name>.workflow.ts`, `storage/storage.ts`.
+```bash
+$ST plugins list                                     # show available + installed
+$ST plugins list --installed                         # show only installed
+$ST plugins install <name> [<name>...] --global      # install by name (global)
+$ST plugins install <name> [<name>...] --local       # install by name (project-local)
+$ST plugins uninstall <name> [<name>...] --global    # remove plugins
+$ST plugins update                                   # pull latest + re-copy installed
+```
+
+When the user asks what plugins are available, run `$ST plugins list` and present the results. For installation in a non-interactive context (Claude Code), always use named install with `--global` or `--local` flag — do not attempt the interactive picker.
+
+## Plugins
+
+supertinker is extensible through plugins. The only built-in is `providers/claude.ts`. Everything else (hooks, workflows, additional providers, storage adapters) is installable via `$ST plugins install`.
+
+Plugins install to `~/.supertinker/` (global) or `.supertinker/` (project-local). Project-local overrides global. To see what's available: `$ST plugins list`.
+
+Manual overrides still work: drop any `.ts` file into `.supertinker/hooks/`, `.supertinker/providers/`, `.supertinker/workflows/`, or `.supertinker/storage/` in your project.
