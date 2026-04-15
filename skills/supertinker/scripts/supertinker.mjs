@@ -13,6 +13,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  statSync,
   writeFileSync
 } from "fs";
 import { spawn, spawnSync } from "child_process";
@@ -317,12 +318,17 @@ async function invokeAgent(node, state, precomputed) {
   const model = state.overrides.model ?? def.model;
   const userPrompt = precomputed?.userPrompt ?? renderUserPrompt(sliceContext(state.context, node.slice), node.instruction);
   const sysPrompt = precomputed?.systemPrompt ?? buildSystemPrompt(state.registry, node);
-  const cwd = resolve(node.cwd ?? process.cwd());
+  const cwd = resolve(state.context[`_worktree:${node.id}`] ?? node.cwd ?? process.cwd());
   const logFile = state.storage.logPath(state.runDir, node.id);
+  const agentTimeout = node.timeout ?? 600000;
   tmux("new-window", `node-${node.id}`, `tail -f ${logFile}`);
   try {
     const invoke = await loadProvider(command);
-    return await invoke({ userPrompt, systemPrompt: sysPrompt, options: Object.keys(node.options ?? {}), cwd, model, logFile });
+    const result = await Promise.race([
+      invoke({ userPrompt, systemPrompt: sysPrompt, options: Object.keys(node.options ?? {}), cwd, model, logFile }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error(`Agent timeout after ${agentTimeout}ms on node "${node.id}"`)), agentTimeout))
+    ]);
+    return result;
   } finally {
     setTimeout(() => tmux("kill-window", `node-${node.id}`), 800);
   }
@@ -376,7 +382,8 @@ async function writePause(state, nodeId, fromNodeId, reason) {
     nodeId: fromNodeId ?? nodeId,
     context: state.context,
     agentOutput: state.context[fromNodeId ?? ""] ?? "",
-    reason
+    reason,
+    iterationCounts: Object.fromEntries(state.iterationCounts)
   };
   await state.storage.savePause(state.runDir, paused);
   await saveContext(state);
@@ -559,7 +566,31 @@ Fix the issue and try again.` };
   await saveContext(state);
   return executeNode(nextNodeId, nodeId, state);
 }
+var catalogCache = null;
+function catalogMtimeKey() {
+  const sources = [
+    join(PROJECT_DIR, "workflows"),
+    join(USER_DIR, "workflows"),
+    join(BUILTIN_DIR, "workflows")
+  ];
+  const parts = [];
+  for (const dir of sources) {
+    try {
+      const files = readdirSync(dir).filter((f) => f.endsWith(".workflow.ts")).sort();
+      for (const file of files) {
+        try {
+          const { mtimeMs } = statSync(join(dir, file));
+          parts.push(`${file}:${mtimeMs}`);
+        } catch {}
+      }
+    } catch {}
+  }
+  return parts.join("|");
+}
 function buildCatalog() {
+  const key = catalogMtimeKey();
+  if (catalogCache && catalogCache.mtimeKey === key)
+    return catalogCache.result;
   const entries = [];
   const sources = [
     [join(PROJECT_DIR, "workflows"), "project"],
@@ -583,9 +614,11 @@ function buildCatalog() {
       } catch {}
     }
   }
-  return entries.length === 0 ? "No workflows available." : `Available workflows (${entries.length}):
+  const result = entries.length === 0 ? "No workflows available." : `Available workflows (${entries.length}):
 ${entries.join(`
 `)}`;
+  catalogCache = { result, mtimeKey: key };
+  return result;
 }
 function resolveWorkflow(name) {
   const file = name.endsWith(".workflow.ts") ? name : `${name}.workflow.ts`;
@@ -631,12 +664,13 @@ async function resume({ workflow, runId, choice, overrides = {} }) {
   const fromNode = graph.nodes.find((n) => n.id === paused.nodeId);
   if (!fromNode?.options?.[choice])
     throw new Error(`Choice "${choice}" not valid for "${paused.nodeId}". Options: ${Object.keys(fromNode?.options ?? {})}`);
+  const restoredIterations = new Map(Object.entries(paused.iterationCounts ?? {}));
   const state = {
     runId,
     runDir,
     context: paused.context,
     joinMap: new Map,
-    iterationCounts: new Map,
+    iterationCounts: restoredIterations,
     graph,
     registry,
     guardrails: workflow.guardrails ?? {},
@@ -680,6 +714,61 @@ async function cli() {
     await resume({ workflow, runId, choice, overrides });
     return;
   }
+  if (cmd === "status") {
+    const runId = get("--run");
+    if (!runId) {
+      console.error("Usage: supertinker status --run <runId>");
+      process.exit(1);
+    }
+    const runDir = join("/tmp/orchestrator", runId);
+    if (!existsSync(runDir)) {
+      console.error(`Run directory not found: ${runDir}`);
+      process.exit(1);
+    }
+    const ctxPath = join(runDir, "context.json");
+    const statePath = join(runDir, "state.json");
+    const hasPause = existsSync(statePath);
+    const hasContext = existsSync(ctxPath);
+    console.log(`
+  Run: ${runId}`);
+    console.log(`  Dir: ${runDir}`);
+    console.log(`  Status: ${hasPause ? "PAUSED" : "completed"}
+`);
+    if (hasPause) {
+      const paused = JSON.parse(readFileSync(statePath, "utf8"));
+      console.log(`  Paused at: ${paused.nodeId}`);
+      if (paused.reason)
+        console.log(`  Reason:    ${paused.reason}`);
+      if (paused.iterationCounts) {
+        const counts = Object.entries(paused.iterationCounts).filter(([, v]) => v > 0);
+        if (counts.length > 0)
+          console.log(`  Iterations: ${counts.map(([k, v]) => `${k}=${v}`).join(", ")}`);
+      }
+      console.log();
+    }
+    if (hasContext) {
+      const ctx = JSON.parse(readFileSync(ctxPath, "utf8"));
+      const keys = Object.keys(ctx);
+      console.log(`  Context keys (${keys.length}):`);
+      for (const key of keys) {
+        const val = ctx[key];
+        const preview = val.length > 120 ? val.slice(0, 120) + "..." : val;
+        console.log(`    [${key}] (${val.length} chars) ${preview.replace(/\n/g, " ")}`);
+      }
+      console.log();
+    }
+    const logPath = join(runDir, "orchestrator.log");
+    if (existsSync(logPath)) {
+      const lines = readFileSync(logPath, "utf8").trim().split(`
+`);
+      const tail = lines.slice(-10);
+      console.log(`  Log (last ${tail.length} of ${lines.length} lines):`);
+      for (const line of tail)
+        console.log(`    ${line}`);
+      console.log();
+    }
+    return;
+  }
   if (cmd === "list") {
     const flag = argv[1];
     if (flag === "--hooks") {
@@ -709,12 +798,14 @@ ${entries.join(`
 Commands:
   run     [--workflow <name|path>] --prompt <text>   (default: meta)
   resume  --run <runId> --choice <label> --workflow <name|path>
+  status  --run <runId>   inspect a run's state and context
   list           show available workflows
   list --hooks   show discovered hooks
 
 Examples:
   tsx supertinker.ts run --prompt "Build a REST API"
   tsx supertinker.ts run --workflow meta --prompt "Build a REST API"
+  tsx supertinker.ts status --run meta-1234567890
   tsx supertinker.ts list`);
 }
 function ensureTmux() {
@@ -736,7 +827,7 @@ function ensureTmux() {
 var isMain = process.argv[1]?.endsWith("supertinker.ts") || process.argv[1]?.endsWith("supertinker.js");
 if (isMain) {
   const cmd = process.argv[2];
-  if (!cmd || cmd === "list" || cmd === "help")
+  if (!cmd || cmd === "list" || cmd === "status" || cmd === "help")
     cli().catch((err) => {
       console.error(err);
       process.exit(1);
@@ -1200,7 +1291,7 @@ IMPLEMENTER agents are the #2 bottleneck. Parallelize them:
   }
 }
 ` };
-var BUILD_STAMP = "2026-04-14T22:56:52.585Z";
+var BUILD_STAMP = "2026-04-15T09:56:24.877Z";
 var userDir = join2(homedir2(), ".supertinker");
 var stampFile = join2(userDir, ".builtin-stamp");
 var needsExtract = !existsSync2(stampFile) || readFileSync2(stampFile, "utf8").trim() !== BUILD_STAMP;
