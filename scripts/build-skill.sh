@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Bundle supertinker into a single .js file.
 #
-# The bundle embeds the core engine, built-in providers, hooks, workflows,
-# and storage. On first run it extracts built-ins to ~/.supertinker/.
-# Project-local plugins (.supertinker/) still override at runtime.
+# The bundle embeds only the claude provider (sole built-in).
+# On first run it extracts the built-in to ~/.supertinker/.
+# Everything else is installable via `supertinker plugins install`.
 #
 # Requires: bun (https://bun.sh)
 
@@ -27,11 +27,6 @@ const path = require('path');
 
 const files = {
   'providers/claude.ts':             fs.readFileSync(path.join('${REPO_ROOT}', 'providers/claude.ts'), 'utf8'),
-  'providers/copilot.ts':            fs.readFileSync(path.join('${REPO_ROOT}', 'providers/copilot.ts'), 'utf8'),
-  'hooks/logger.ts':                 fs.readFileSync(path.join('${REPO_ROOT}', 'hooks/logger.ts'), 'utf8'),
-  'hooks/tmux-panes.ts':             fs.readFileSync(path.join('${REPO_ROOT}', 'hooks/tmux-panes.ts'), 'utf8'),
-  'hooks/validate-templates.ts':     fs.readFileSync(path.join('${REPO_ROOT}', 'hooks/validate-templates.ts'), 'utf8'),
-  'workflows/meta.workflow.ts':      fs.readFileSync(path.join('${REPO_ROOT}', 'workflows/meta.workflow.ts'), 'utf8'),
 };
 
 const embedded = JSON.stringify(files);
@@ -101,26 +96,38 @@ async function main() {
   }
 
   if (cmd === \"list\") {
-    console.log(await buildCatalog())
+    const storage = await loadStorage()
+    console.log(await buildCatalog(storage))
+    return
+  }
+
+  if (cmd === \"plugins\") {
+    const { execSync } = await import(\"child_process\")
+    const cliPath = resolve(\"${REPO_ROOT}\", \"cli.ts\")
+    const raw = process.argv.slice(2)
+    const escaped = raw.map(function(s: string) { return \"'\" + s.replace(/'/g, \"'\\\\\\\\''\") + \"'\" }).join(\" \")
+    try {
+      execSync(\"tsx \" + cliPath + \" \" + escaped, { stdio: \"inherit\", cwd: process.cwd() })
+    } catch (e: any) {
+      if (e.status) process.exit(e.status)
+    }
     return
   }
 
   console.log(\\\`supertinker — minimal agent orchestrator
 
 Commands:
-  run     [--workflow <name|path>] --prompt <text> [--provider <name>] [--model <name>]
-  resume  --run <runId> --choice <label> --workflow <name|path> [--provider <name>] [--model <name>]
-  list    show available workflows
-
-Options:
-  --provider   Override provider for all agents (e.g. copilot, claude)
-  --model      Override model for all agents (e.g. opus, gpt-4o)
+  run       [--workflow <name|path>] --prompt <text> [--provider <name>] [--model <name>]
+  resume    --run <runId> --choice <label> --workflow <name|path>
+  list             show available workflows
+  plugins list     show available/installed plugins
+  plugins install  install plugins
+  plugins update   pull latest + re-copy installed
 
 Examples:
   supertinker run --prompt \"Build a REST API\"
-  supertinker run --prompt \"Build a REST API\" --provider copilot --model gpt-4o
-  supertinker run --prompt \"Build a REST API\" --model opus
-  supertinker list\\\`)
+  supertinker plugins list
+  supertinker plugins install logger fork-worktree --global\\\`)
 }
 
 main().catch(err => { console.error(err); process.exit(1) })
