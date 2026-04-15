@@ -134,7 +134,8 @@ async function cli(): Promise<void> {
       console.log(entries.length === 0 ? "No hooks found." : `Hooks (${entries.length}):\n${entries.join("\n")}`)
       return
     }
-    console.log(await buildCatalog())
+    const storage = await loadStorage()
+    console.log(await buildCatalog(storage))
     return
   }
 
