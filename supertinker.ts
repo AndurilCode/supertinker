@@ -10,7 +10,7 @@
  */
 
 import { appendFileSync, existsSync, mkdirSync, readdirSync,
-         readFileSync, writeFileSync }                          from "fs"
+         readFileSync, statSync, writeFileSync }                from "fs"
 import { spawn, spawnSync }                                     from "child_process"
 import { join, resolve }                                        from "path"
 import { homedir }                                              from "os"
@@ -27,6 +27,7 @@ export interface GraphNode {
   instruction?: string
   systemPrompt?: string
   options?:     Record<string, string>
+  timeout?:     number     // agent invocation timeout in ms (default: 600000 = 10 min)
   fallback?:    string
   targets?:     string[]
   waits_for?:   string[]
@@ -66,6 +67,7 @@ export interface AgentResult { output: string; choice: string; transcriptPath?: 
 
 export interface PausedState {
   runId: string; nodeId: string; context: Context; agentOutput: string; reason?: string
+  iterationCounts?: Record<string, number>
 }
 
 // ─── STORAGE ADAPTER
@@ -452,13 +454,19 @@ async function invokeAgent(
   const model      = state.overrides.model ?? def.model
   const userPrompt = precomputed?.userPrompt  ?? renderUserPrompt(sliceContext(state.context, node.slice), node.instruction)
   const sysPrompt  = precomputed?.systemPrompt ?? buildSystemPrompt(state.registry, node)
-  const cwd        = resolve(node.cwd ?? process.cwd())
+  const cwd        = resolve(state.context[`_worktree:${node.id}`] ?? node.cwd ?? process.cwd())
   const logFile    = state.storage.logPath(state.runDir, node.id)
+
+  const agentTimeout = node.timeout ?? 600_000  // default 10 minutes
 
   tmux("new-window", `node-${node.id}`, `tail -f ${logFile}`)
   try {
     const invoke = await loadProvider(command)
-    return await invoke({ userPrompt, systemPrompt: sysPrompt, options: Object.keys(node.options ?? {}), cwd, model, logFile })
+    const result = await Promise.race([
+      invoke({ userPrompt, systemPrompt: sysPrompt, options: Object.keys(node.options ?? {}), cwd, model, logFile }),
+      new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`Agent timeout after ${agentTimeout}ms on node "${node.id}"`)), agentTimeout)),
+    ])
+    return result
   } finally {
     setTimeout(() => tmux("kill-window", `node-${node.id}`), 800)
   }
@@ -512,6 +520,7 @@ async function writePause(state: RunState, nodeId: string, fromNodeId: string | 
   const paused: PausedState = {
     runId: state.runId, nodeId: fromNodeId ?? nodeId, context: state.context,
     agentOutput: state.context[fromNodeId ?? ""] ?? "", reason,
+    iterationCounts: Object.fromEntries(state.iterationCounts),
   }
   await state.storage.savePause(state.runDir, paused)
   await saveContext(state)
@@ -678,7 +687,30 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
 
 // ─── WORKFLOW LIBRARY
 
+let catalogCache: { result: string; mtimeKey: string } | null = null
+
+function catalogMtimeKey(): string {
+  const sources = [
+    join(PROJECT_DIR, "workflows"),
+    join(USER_DIR, "workflows"),
+    join(BUILTIN_DIR, "workflows"),
+  ]
+  const parts: string[] = []
+  for (const dir of sources) {
+    try {
+      const files = readdirSync(dir).filter((f: string) => f.endsWith(".workflow.ts")).sort()
+      for (const file of files) {
+        try { const { mtimeMs } = statSync(join(dir, file)); parts.push(`${file}:${mtimeMs}`) } catch {}
+      }
+    } catch {}
+  }
+  return parts.join("|")
+}
+
 export function buildCatalog(): string {
+  const key = catalogMtimeKey()
+  if (catalogCache && catalogCache.mtimeKey === key) return catalogCache.result
+
   const entries: string[] = []
   const sources: Array<[string, string]> = [
     [join(PROJECT_DIR, "workflows"), "project"],
@@ -698,7 +730,9 @@ export function buildCatalog(): string {
       } catch {}
     }
   }
-  return entries.length === 0 ? "No workflows available." : `Available workflows (${entries.length}):\n${entries.join("\n")}`
+  const result = entries.length === 0 ? "No workflows available." : `Available workflows (${entries.length}):\n${entries.join("\n")}`
+  catalogCache = { result, mtimeKey: key }
+  return result
 }
 
 export function resolveWorkflow(name: string): string | null {
@@ -745,9 +779,10 @@ export async function resume({ workflow, runId, choice, overrides = {} }: { work
   const fromNode = graph.nodes.find(n => n.id === paused.nodeId)
   if (!fromNode?.options?.[choice]) throw new Error(`Choice "${choice}" not valid for "${paused.nodeId}". Options: ${Object.keys(fromNode?.options ?? {})}`)
 
+  const restoredIterations = new Map(Object.entries(paused.iterationCounts ?? {}))
   const state: RunState = {
     runId, runDir, context: paused.context, joinMap: new Map(),
-    iterationCounts: new Map(), graph, registry, guardrails: workflow.guardrails ?? {}, hooks, storage, overrides,
+    iterationCounts: restoredIterations, graph, registry, guardrails: workflow.guardrails ?? {}, hooks, storage, overrides,
   }
 
   await emitHook("Resumed", { nodeId: paused.nodeId, choice }, state)
@@ -786,6 +821,55 @@ async function cli(): Promise<void> {
     return
   }
 
+  if (cmd === "status") {
+    const runId = get("--run")
+    if (!runId) { console.error("Usage: supertinker status --run <runId>"); process.exit(1) }
+    const runDir = join("/tmp/orchestrator", runId)
+    if (!existsSync(runDir)) { console.error(`Run directory not found: ${runDir}`); process.exit(1) }
+
+    const ctxPath = join(runDir, "context.json")
+    const statePath = join(runDir, "state.json")
+    const hasPause = existsSync(statePath)
+    const hasContext = existsSync(ctxPath)
+
+    console.log(`\n  Run: ${runId}`)
+    console.log(`  Dir: ${runDir}`)
+    console.log(`  Status: ${hasPause ? "PAUSED" : "completed"}\n`)
+
+    if (hasPause) {
+      const paused: PausedState = JSON.parse(readFileSync(statePath, "utf8"))
+      console.log(`  Paused at: ${paused.nodeId}`)
+      if (paused.reason) console.log(`  Reason:    ${paused.reason}`)
+      if (paused.iterationCounts) {
+        const counts = Object.entries(paused.iterationCounts).filter(([, v]) => v > 0)
+        if (counts.length > 0) console.log(`  Iterations: ${counts.map(([k, v]) => `${k}=${v}`).join(", ")}`)
+      }
+      console.log()
+    }
+
+    if (hasContext) {
+      const ctx = JSON.parse(readFileSync(ctxPath, "utf8"))
+      const keys = Object.keys(ctx)
+      console.log(`  Context keys (${keys.length}):`)
+      for (const key of keys) {
+        const val = ctx[key]
+        const preview = val.length > 120 ? val.slice(0, 120) + "..." : val
+        console.log(`    [${key}] (${val.length} chars) ${preview.replace(/\n/g, " ")}`)
+      }
+      console.log()
+    }
+
+    const logPath = join(runDir, "orchestrator.log")
+    if (existsSync(logPath)) {
+      const lines = readFileSync(logPath, "utf8").trim().split("\n")
+      const tail = lines.slice(-10)
+      console.log(`  Log (last ${tail.length} of ${lines.length} lines):`)
+      for (const line of tail) console.log(`    ${line}`)
+      console.log()
+    }
+    return
+  }
+
   if (cmd === "list") {
     const flag = argv[1]
     if (flag === "--hooks") {
@@ -813,12 +897,14 @@ async function cli(): Promise<void> {
 Commands:
   run     [--workflow <name|path>] --prompt <text>   (default: meta)
   resume  --run <runId> --choice <label> --workflow <name|path>
+  status  --run <runId>   inspect a run's state and context
   list           show available workflows
   list --hooks   show discovered hooks
 
 Examples:
   tsx supertinker.ts run --prompt "Build a REST API"
   tsx supertinker.ts run --workflow meta --prompt "Build a REST API"
+  tsx supertinker.ts status --run meta-1234567890
   tsx supertinker.ts list`)
 }
 
@@ -846,6 +932,6 @@ const isMain = process.argv[1]?.endsWith("supertinker.ts") || process.argv[1]?.e
 
 if (isMain) {
   const cmd = process.argv[2]
-  if (!cmd || cmd === "list" || cmd === "help") cli().catch(err => { console.error(err); process.exit(1) })
+  if (!cmd || cmd === "list" || cmd === "status" || cmd === "help") cli().catch(err => { console.error(err); process.exit(1) })
   else if (ensureTmux()) cli().catch(err => { console.error(err); process.exit(1) })
 }
