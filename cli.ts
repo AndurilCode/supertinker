@@ -96,16 +96,16 @@ function saveInstalled(targetDir: string, data: InstalledJson): void {
   writeFileSync(join(targetDir, "installed.json"), JSON.stringify(data, null, 2))
 }
 
-function copyPluginFile(src: string, dest: string): void {
+function copyPluginFile(src: string, dest: string, cacheRoot: string): void {
   if (src.endsWith(".ts")) {
-    // Rewrite type imports to point at the cached supertinker.ts — always exists
-    // at ~/.supertinker/cache/supertinker/ after first plugins command. This gives
-    // IDE type-checking in any repo without depending on a local supertinker.ts.
-    const cachedSupertinker = join(USER_HOME, "cache", "supertinker", "supertinker.js")
+    // Rewrite type imports to point at supertinker.ts in the resolved cache root
+    // (either the npm-installed package dir or ~/.supertinker/cache/supertinker/).
+    // These are type-only imports (erased at runtime) — just for IDE type-checking.
+    const supertinkerPath = join(cacheRoot, "supertinker.js")
     let content = readFileSync(src, "utf8")
     content = content.replace(
       /from\s+["'][^"']*supertinker(?:\.js)?["']/g,
-      `from "${cachedSupertinker}"`,
+      `from "${supertinkerPath}"`,
     )
     writeFileSync(dest, content)
   } else {
@@ -342,7 +342,7 @@ async function installPlugins(names: string[], scope: "global" | "local"): Promi
     mkdirSync(destDir, { recursive: true })
 
     for (const file of manifest.files) {
-      copyPluginFile(join(sourceDir, file), join(destDir, file))
+      copyPluginFile(join(sourceDir, file), join(destDir, file), cacheRoot)
     }
 
     installed.plugins.push({
@@ -425,7 +425,7 @@ function pluginsUpdate(): void {
     const destDir = join(USER_HOME, TYPE_TO_DIR[manifest.type])
     mkdirSync(destDir, { recursive: true })
     for (const file of manifest.files) {
-      copyPluginFile(join(sourceDir, file), join(destDir, file))
+      copyPluginFile(join(sourceDir, file), join(destDir, file), CACHE_DIR)
     }
     const changed = entry.version !== manifest.version
     if (changed) {
@@ -447,7 +447,7 @@ function pluginsUpdate(): void {
     const destDir = join(localDir, TYPE_TO_DIR[manifest.type])
     mkdirSync(destDir, { recursive: true })
     for (const file of manifest.files) {
-      copyPluginFile(join(sourceDir, file), join(destDir, file))
+      copyPluginFile(join(sourceDir, file), join(destDir, file), CACHE_DIR)
     }
     const changed = entry.version !== manifest.version
     if (changed) {
