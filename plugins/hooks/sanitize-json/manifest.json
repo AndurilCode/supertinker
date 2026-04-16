@@ -1,0 +1,7 @@
+{
+  "name": "sanitize-json",
+  "type": "hook",
+  "description": "Strips markdown code fences from agent output that should be raw JSON",
+  "files": ["sanitize-json.ts"],
+  "version": "1.0.0"
+}
