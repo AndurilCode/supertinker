@@ -94,3 +94,13 @@ supertinker is extensible through plugins. The only built-in is `providers/claud
 Plugins install to `~/.supertinker/` (global) or `.supertinker/` (project-local). Project-local overrides global. To see what's available: `$ST plugins list`.
 
 Manual overrides still work: drop any `.ts` file into `.supertinker/hooks/`, `.supertinker/providers/`, `.supertinker/workflows/`, or `.supertinker/storage/` in your project.
+
+## Building Plugins
+
+When the user wants to **create** a new workflow, provider, hook, or storage adapter — or asks how any of those work — invoke the `supertinker-doc` skill:
+
+```
+Skill({ skill: "supertinker-doc" })
+```
+
+`supertinker-doc` contains the full authoring reference: schemas, interfaces, examples, search-path rules, and the plugin manifest format.
