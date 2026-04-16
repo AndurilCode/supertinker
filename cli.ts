@@ -820,7 +820,7 @@ Examples:
 
 const cmd = process.argv[2]
 const isQuiet = process.argv.includes("--quiet")
-const isDashboard = (cmd === "run" || cmd === "resume") && !isQuiet
+const isDashboard = false // TODO: re-enable when dashboard is stable — was: (cmd === "run" || cmd === "resume") && !isQuiet
 
 // Sub-workflow resume: bridge the "sub-" directory convention before tmux forks.
 // The core's resume() looks at /tmp/orchestrator/<runId> but sub-workflows live
