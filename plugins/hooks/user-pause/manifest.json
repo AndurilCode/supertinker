@@ -1,0 +1,7 @@
+{
+  "name": "user-pause",
+  "type": "hook",
+  "description": "Pause on user request — checks for pause-requested file on PreAgent",
+  "files": ["user-pause.ts"],
+  "version": "1.0.0"
+}
