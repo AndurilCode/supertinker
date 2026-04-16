@@ -21,6 +21,7 @@ interface AgentResult {
 function run(command: string, args: string[], cwd: string, logFile: string): Promise<string> {
   return new Promise((res, rej) => {
     const proc = spawn(command, args, { cwd, env: process.env, detached: true, stdio: ["pipe", "pipe", "pipe"] })
+    proc.unref()
     let out = "", err = ""
     proc.stdout.on("data", (chunk: Buffer) => {
       const txt = chunk.toString(); out += txt
