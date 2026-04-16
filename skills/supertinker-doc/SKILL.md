@@ -94,7 +94,7 @@ export const workflow: Workflow = {
 
   // Standard nodes only:
   agent?: string,              // key in registry
-  instruction?: string,        // prepended to context; use [nodeId] to reference prior outputs
+  instruction?: string,        // prepended to context; use [nodeId] to reference prior outputs (see warning below)
   systemPrompt?: string,       // appended to the agent's base systemPrompt
   options?: Record<string, string>,  // { "label": "next_node_id" }
   slice?: string[],            // limit context keys visible to this agent
@@ -112,6 +112,10 @@ export const workflow: Workflow = {
   source?: string,             // context key holding a JSON-serialised Workflow
 }
 ```
+
+### Template Variable Warning
+
+The `validate-templates` hook treats any `[word]` in `instruction` fields as a context variable reference. Unresolved references abort the run. Only use `[word]` for node IDs or context keys — use plain text or angle brackets for labels.
 
 ### Minimal Linear Workflow Example
 
