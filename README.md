@@ -5,7 +5,7 @@
 <h1 align="center">supertinker</h1>
 
 <p align="center">
-  <strong>deterministic, resumable, multi-agent workflows in a single TypeScript file</strong>
+  <strong>a thin, composable multi-agent orchestrator — one file, zero dependencies, infinitely extensible</strong>
 </p>
 
 <p align="center">
