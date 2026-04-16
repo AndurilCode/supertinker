@@ -17,6 +17,8 @@ const HIDE_CURSOR = `${ESC}?25l`
 const SHOW_CURSOR = `${ESC}?25h`
 const HOME = `${ESC}H`
 const CLEAR_BELOW = `${ESC}J`
+const ALT_SCREEN_ON  = `${ESC}?1049h`  // enter alternate screen buffer (disables trackpad scroll)
+const ALT_SCREEN_OFF = `${ESC}?1049l`  // exit alternate screen buffer
 const RESET = `${ESC}0m`
 const BOLD = `${ESC}1m`
 const DIM = `${ESC}2m`
@@ -112,6 +114,8 @@ interface PipelineState {
   forkTargets: Map<string, string[]>
   pauseReason?: string
   error?: string
+  graph?: { nodes: Array<{ id: string }> }
+  subPaused?: { workflowId: string; nodeId: string; reason?: string }
 }
 
 // ─── TRANSCRIPT STREAM
@@ -229,64 +233,99 @@ function derivePipelineState(events: PipelineEvent[], runDir: string): PipelineS
   const forkTargets = new Map<string, string[]>()
   let status: RunStatus = "starting"
   let workflowId = ""
-  let runId = ""
+  let mainRunId = ""
   let startedAt = Date.now()
   let pauseReason: string | undefined
   let error: string | undefined
+  let graph: { nodes: Array<{ id: string }> } | undefined
+  let subPaused: { workflowId: string; nodeId: string; reason?: string } | undefined
+
+  // Track active sub-workflows for display-name prefixing
+  const activeSubWorkflows = new Map<string, string>() // runId prefix -> innerWorkflowId
 
   for (const evt of events) {
-    runId = evt.runId ?? runId
+    const evtRunId = evt.runId as string ?? ""
+    const isSub = evtRunId.includes("/")
 
-    if (evt.event === "RunStart") {
+    // Determine display key: prefix sub-workflow node IDs to avoid collisions
+    const rawNodeId = evt.nodeId as string | undefined
+    let subPrefix = ""
+    if (isSub && rawNodeId) {
+      const subRunId = evtRunId.split("/").slice(1).join("/")
+      subPrefix = (activeSubWorkflows.get(subRunId) ?? subRunId) + "/"
+    }
+    const displayNodeId = rawNodeId ? subPrefix + rawNodeId : undefined
+
+    if (!isSub) mainRunId = evtRunId
+
+    if (evt.event === "RunStart" && !isSub) {
       status = "running"
       workflowId = (evt.workflow as string) ?? ""
       startedAt = new Date(evt.ts).getTime()
+      const wf = evt.workflow as any
+      if (wf?.graph?.nodes) graph = wf.graph
     }
 
-    if (evt.event === "PreAgent") {
-      const nodeId = evt.nodeId as string
+    if (evt.event === "SubworkflowStart") {
+      const innerWfId = evt.innerWorkflowId as string
+      if (innerWfId) {
+        activeSubWorkflows.set(innerWfId, innerWfId)
+      }
+    }
+
+    if (evt.event === "PreAgent" && displayNodeId) {
       const agent = evt.agent as string
       const provider = evt.provider as string
-      const evtRunId = evt.runId as string
       let agentDir = runDir
-      if (evtRunId && evtRunId.includes("/")) {
+      if (isSub) {
         const subId = evtRunId.split("/").slice(1).join("/")
         const subDir = join(runDir, `sub-${subId}`)
         if (existsSync(subDir)) agentDir = subDir
       }
-      activeAgents.set(nodeId, {
-        nodeId, agent, provider,
+      activeAgents.set(displayNodeId, {
+        nodeId: displayNodeId, agent, provider,
         startedAt: new Date(evt.ts).getTime(),
-        metaPath: join(agentDir, `${nodeId}.meta.json`),
-        logFile: join(agentDir, `${nodeId}.log`),
+        metaPath: join(agentDir, `${rawNodeId}.meta.json`),
+        logFile: join(agentDir, `${rawNodeId}.log`),
       })
       if (status === "starting") status = "running"
     }
 
-    if (evt.event === "PostAgent") {
-      completedNodes.add(evt.nodeId as string)
-      activeAgents.delete(evt.nodeId as string)
+    if (evt.event === "PostAgent" && displayNodeId) {
+      completedNodes.add(displayNodeId)
+      activeAgents.delete(displayNodeId)
     }
 
-    if (evt.event === "ForkStart") {
-      forkTargets.set(evt.nodeId as string, evt.targets as string[])
+    if (evt.event === "ForkStart" && displayNodeId) {
+      forkTargets.set(displayNodeId, evt.targets as string[])
     }
 
     if (evt.event === "Paused") {
-      status = "paused"
-      pauseReason = evt.reason as string | undefined
+      if (isSub) {
+        // Sub-workflow pause — track separately so outer status isn't overwritten
+        const subId = evtRunId.split("/").slice(1).join("/")
+        subPaused = {
+          workflowId: activeSubWorkflows.get(subId) ?? subId,
+          nodeId: rawNodeId ?? "?",
+          reason: evt.reason as string | undefined,
+        }
+      } else {
+        status = "paused"
+        pauseReason = evt.reason as string | undefined
+      }
     }
 
     if (evt.event === "Resumed") {
-      status = "running"
-      pauseReason = undefined
+      if (isSub) {
+        subPaused = undefined
+      } else {
+        status = "running"
+        pauseReason = undefined
+      }
     }
 
-    if (evt.event === "RunEnd") {
-      const evtRunId = evt.runId as string
-      if (!evtRunId || !evtRunId.includes("/")) {
-        status = (evt.terminal as string) === "done" ? "done" : "failed"
-      }
+    if (evt.event === "RunEnd" && !isSub) {
+      status = (evt.terminal as string) === "done" ? "done" : "failed"
     }
 
     if (evt.event === "Error") {
@@ -294,7 +333,10 @@ function derivePipelineState(events: PipelineEvent[], runDir: string): PipelineS
     }
   }
 
-  return { status, workflowId, runId, startedAt, completedNodes, activeAgents, forkTargets, pauseReason, error }
+  return {
+    status, workflowId, runId: mainRunId, startedAt, completedNodes,
+    activeAgents, forkTargets, pauseReason, error, graph, subPaused,
+  }
 }
 
 // ─── DISPLAY EVENT FORMATTING
@@ -304,21 +346,63 @@ function oneline(s: string): string {
   return s.replace(/\n/g, " ").replace(/\s+/g, " ").trim()
 }
 
+/** Wrap a string to fit within `maxWidth` visible chars, returning multiple lines.
+ *  Preserves ANSI codes across line breaks. */
+function wordWrap(str: string, maxWidth: number): string[] {
+  if (maxWidth <= 0) return [str]
+  const lines: string[] = []
+  let remaining = str
+  while (remaining.length > 0) {
+    const vis = visLen(remaining)
+    if (vis <= maxWidth) { lines.push(remaining); break }
+    // Find the split point at maxWidth visible chars
+    let visCount = 0
+    let splitIdx = 0
+    for (let i = 0; i < remaining.length; i++) {
+      if (remaining[i] === "\x1b" && remaining[i + 1] === "[") {
+        const end = remaining.indexOf("m", i)
+        if (end !== -1) { i = end; continue }
+      }
+      visCount++
+      if (visCount >= maxWidth) { splitIdx = i + 1; break }
+    }
+    if (splitIdx === 0) break
+    lines.push(remaining.slice(0, splitIdx) + RESET)
+    remaining = remaining.slice(splitIdx)
+  }
+  return lines.length === 0 ? [""] : lines
+}
+
 function formatDisplayEvent(evt: DisplayEvent): string {
   switch (evt.t) {
-    case "thinking": return `${DIM}  ${oneline(evt.text)}${RESET}`
-    case "text": return oneline(evt.text)
+    case "thinking": return `${DIM}  ${evt.text}${RESET}`
+    case "text": return evt.text
     case "tool_start": {
-      const argStr = Object.entries(evt.args).map(([k, v]) => `${k}=${oneline(v)}`).join(" ")
+      const argStr = Object.entries(evt.args).map(([k, v]) => `${k}=${v}`).join(" ")
       return `${YELLOW}[${evt.name}]${RESET} ${argStr}`
     }
-    case "tool_end": return `${DIM}  -> ${oneline(evt.result)}${RESET}`
-    case "subagent_start": return `>> ${evt.name}: ${oneline(evt.desc)}`
+    case "tool_end": return `${DIM}  -> ${evt.result}${RESET}`
+    case "subagent_start": return `>> ${evt.name}: ${evt.desc}`
     case "subagent_end": return `<< ${evt.id} (${evt.tools} tools, ${Math.round(evt.duration_ms / 1000)}s)`
-    case "error": return `${RED}ERROR: ${oneline(evt.text)}${RESET}`
+    case "error": return `${RED}ERROR: ${evt.text}${RESET}`
     case "start": return `Starting ${evt.provider}${evt.model ? ` (${evt.model})` : ""}`
     case "end": return "Agent finished"
   }
+}
+
+/** Convert display lines into wrapped box-ready lines */
+function wrapDisplayLines(displayLines: string[], innerWidth: number): string[] {
+  const wrapped: string[] = []
+  for (const line of displayLines) {
+    // Split on actual newlines first, then word-wrap each part
+    const parts = line.split("\n")
+    for (const part of parts) {
+      const trimmed = part.replace(/\s+$/, "")
+      if (trimmed.length === 0) { wrapped.push(""); continue }
+      wrapped.push(...wordWrap(trimmed, innerWidth))
+    }
+  }
+  return wrapped
 }
 
 // ─── FRAME BUILDER
@@ -391,11 +475,15 @@ function boxLine(content: string, w: number): string {
   return `│ ${fitTo(content, w - 4)} │`
 }
 
-function buildFrame(state: PipelineState, transcripts: Map<string, TranscriptStream>, spinnerIdx: number, cols: number): string {
+function buildFrame(
+  state: PipelineState, transcripts: Map<string, TranscriptStream>,
+  spinnerIdx: number, cols: number, rows: number,
+): string {
   const lines: string[] = []
   const w = cols
+  const innerW = w - 4  // usable width inside box borders
 
-  // Header
+  // ── Header (3 lines)
   const elapsedStr = elapsed(Date.now() - state.startedAt)
   const wfId = state.workflowId || "..."
   const rId = state.runId.slice(0, 30) || "..."
@@ -407,61 +495,146 @@ function buildFrame(state: PipelineState, transcripts: Map<string, TranscriptStr
   ))
   lines.push(`└${hline("─", w - 2)}┘`)
 
-  // Pipeline progress
+  // ── Progress bar with node counter (1-2 lines)
   const spinner = SPINNER_FRAMES[spinnerIdx % SPINNER_FRAMES.length]
+  const totalNodes = state.graph?.nodes?.length ?? 0
+  const completedCount = state.completedNodes.size
+  const activeCount = state.activeAgents.size
+  const counterStr = totalNodes > 0
+    ? `${DIM}[${completedCount}/${totalNodes}]${RESET} `
+    : ""
+
   const nodeStrs: string[] = []
   for (const id of state.completedNodes) nodeStrs.push(`${GREEN}✓ ${id}${RESET}`)
   for (const id of state.activeAgents.keys()) nodeStrs.push(`${YELLOW}${spinner} ${id}${RESET}`)
   const progressLine = nodeStrs.length > 0
-    ? nodeStrs.join(` ${DIM}->${RESET} `)
+    ? counterStr + nodeStrs.join(` ${DIM}→${RESET} `)
     : `${DIM}Waiting for pipeline events...${RESET}`
   lines.push(` ${truncate(progressLine, w - 2)}`)
 
-  // Error / pause
+  // Error / pause / sub-workflow pause
   if (state.error) lines.push(` ${truncate(`${RED}Error: ${state.error}${RESET}`, w - 2)}`)
   if (state.pauseReason) lines.push(` ${truncate(`${YELLOW}Paused: ${state.pauseReason}${RESET}`, w - 2)}`)
+  if (state.subPaused) {
+    const sp = state.subPaused
+    const subMsg = sp.reason
+      ? `Sub-workflow ${sp.workflowId} paused at ${sp.nodeId}: ${sp.reason}`
+      : `Sub-workflow ${sp.workflowId} paused at ${sp.nodeId}`
+    lines.push(` ${truncate(`${YELLOW}⚠ ${subMsg}${RESET}`, w - 2)}`)
+  }
 
-  // Agent panels
+  // ── Control bar (3 lines) — calculate early so we know remaining space
+  const controlBarHeight = 3
+
+  // ── Calculate available space for agent panels
+  const usedLines = lines.length + controlBarHeight
+  let availableRows = Math.max(4, rows - usedLines)
+
+  // ── Agent panels
   const agents = Array.from(state.activeAgents.values())
+
   if (agents.length === 0 && state.status !== "done" && state.status !== "failed") {
     lines.push(``)
     lines.push(` ${DIM}Waiting for agent...${RESET}`)
     lines.push(``)
   }
 
-  for (const agent of agents) {
-    const key = agent.nodeId
-    if (!transcripts.has(key)) {
-      transcripts.set(key, new TranscriptStream(agent.metaPath, agent.logFile, loadMapperFn!, 50))
-    }
-    const ts = transcripts.get(key)!
-    const panelLines = ts.getDisplayLines(8)
-    const ae = agentElapsed(Date.now() - agent.startedAt)
-
-    lines.push(`╭${hline("─", w - 2)}╮`)
-    lines.push(boxLR(
-      `${BOLD}${GREEN}${spinner} ${agent.agent}${RESET}`,
-      `${DIM}${agent.provider}${RESET}  ${ae}`,
-      w
-    ))
-    for (const pl of panelLines) {
-      lines.push(boxLine(pl, w))
-    }
-    if (panelLines.length === 0) {
-      lines.push(boxLine(`${DIM}Waiting for transcript...${RESET}`, w))
-    }
-    lines.push(`╰${hline("─", w - 2)}╯`)
+  // Auto-focus the only active agent, or keep current focus if valid
+  if (agents.length === 1) {
+    focusedAgent = agents[0].nodeId
+  } else if (focusedAgent && !state.activeAgents.has(focusedAgent)) {
+    focusedAgent = agents.length > 0 ? agents[0].nodeId : null
   }
 
-  // Control bar
+  if (agents.length > 0) {
+    // Each panel needs at minimum: 3 lines (top border + header + bottom border) + 1 content line
+    const panelOverhead = 3  // top border, header, bottom border
+    const minContentLines = 2
+    const perPanel = Math.max(
+      minContentLines + panelOverhead,
+      Math.floor(availableRows / agents.length),
+    )
+
+    for (const agent of agents) {
+      const key = agent.nodeId
+      if (!transcripts.has(key)) {
+        transcripts.set(key, new TranscriptStream(agent.metaPath, agent.logFile, loadMapperFn!, 200))
+      }
+      const ts = transcripts.get(key)!
+
+      const contentHeight = perPanel - panelOverhead
+      // Get more lines than we need so we can scroll through them
+      const rawLines = ts.getDisplayLines(500)
+      const allWrapped = wrapDisplayLines(rawLines, innerW)
+
+      // Scroll support
+      if (!scrollOffsets.has(key)) scrollOffsets.set(key, 0)
+      const scrollOff = scrollOffsets.get(key)!
+      const totalWrapped = allWrapped.length
+      const maxScroll = Math.max(0, totalWrapped - contentHeight)
+      // scrollOff=0 means pinned to bottom (latest), positive = scrolled up
+      const clampedScroll = Math.min(scrollOff, maxScroll)
+      scrollOffsets.set(key, clampedScroll)
+
+      const startIdx = Math.max(0, totalWrapped - contentHeight - clampedScroll)
+      const visibleLines = allWrapped.slice(startIdx, startIdx + contentHeight)
+
+      const ae = agentElapsed(Date.now() - agent.startedAt)
+      const isFocused = focusedAgent === key
+      const focusIndicator = (agents.length > 1 && isFocused) ? `${CYAN}▸${RESET} ` : ""
+
+      // Scroll indicators
+      const canScrollUp = startIdx > 0
+      const canScrollDown = clampedScroll > 0
+      const scrollHint = (canScrollUp || canScrollDown)
+        ? ` ${DIM}${canScrollUp ? "▲" : " "}${canScrollDown ? "▼" : " "}${RESET}`
+        : ""
+
+      lines.push(`╭${hline("─", w - 2)}╮`)
+      lines.push(boxLR(
+        `${focusIndicator}${BOLD}${GREEN}${spinner} ${agent.agent}${RESET}`,
+        `${DIM}${agent.provider}${RESET}  ${ae}${scrollHint}`,
+        w
+      ))
+
+      if (visibleLines.length === 0) {
+        lines.push(boxLine(`${DIM}Waiting for transcript...${RESET}`, w))
+        // Fill remaining content height
+        for (let i = 1; i < contentHeight; i++) lines.push(boxLine("", w))
+      } else {
+        for (const pl of visibleLines) {
+          lines.push(boxLine(pl, w))
+        }
+        // Pad if fewer lines than content height
+        for (let i = visibleLines.length; i < contentHeight; i++) {
+          lines.push(boxLine("", w))
+        }
+      }
+      lines.push(`╰${hline("─", w - 2)}╯`)
+    }
+  }
+
+  // ── Control bar
+  // Derive effective status: if outer is "done" but a sub-workflow paused, show warning
+  const hasSubPause = !!state.subPaused
+  const effectiveStatus = (state.status === "done" && hasSubPause) ? "done (sub paused)" : state.status
   const statusColor = state.status === "running" ? GREEN
     : state.status === "paused" ? YELLOW
+    : (state.status === "done" && hasSubPause) ? YELLOW
     : state.status === "done" ? CYAN
     : state.status === "failed" ? RED : ""
+
+  const scrollKeys = agents.length > 0
+    ? `  ${DIM}[↑/↓]${RESET} scroll`
+    : ""
+  const tabKey = agents.length > 1
+    ? `  ${DIM}[tab]${RESET} focus`
+    : ""
+
   lines.push(`┌${hline("─", w - 2)}┐`)
   lines.push(boxLR(
-    `${DIM}[p]${RESET} pause  ${DIM}[r]${RESET} resume  ${DIM}[q]${RESET} quit`,
-    `${BOLD}${statusColor}${state.status.toUpperCase()}${RESET}`,
+    `${DIM}[p]${RESET} pause  ${DIM}[r]${RESET} resume  ${DIM}[q]${RESET} quit${scrollKeys}${tabKey}`,
+    `${BOLD}${statusColor}${effectiveStatus.toUpperCase()}${RESET}`,
     w
   ))
   lines.push(`└${hline("─", w - 2)}┘`)
@@ -472,6 +645,10 @@ function buildFrame(state: PipelineState, transcripts: Map<string, TranscriptStr
 // ─── MODULE STATE (set by renderDashboard)
 
 let loadMapperFn: ((provider: string) => Promise<TranscriptMapper | null>) | null = null
+
+// Scroll state: per-agent scroll offset (0 = pinned to bottom / latest)
+const scrollOffsets = new Map<string, number>()
+let focusedAgent: string | null = null  // which agent panel is focused for scrolling
 
 // ─── PUBLIC API
 
@@ -491,7 +668,7 @@ export function renderDashboard(opts: DashboardOptions): void {
     try { writeSync(1, s) } catch {}
   }
 
-  write(HIDE_CURSOR)
+  write(ALT_SCREEN_ON + HIDE_CURSOR)
 
   const eventTailers = new Map<string, FileTailer>()
   const transcripts = new Map<string, TranscriptStream>()
@@ -501,9 +678,10 @@ export function renderDashboard(opts: DashboardOptions): void {
   const renderInterval = setInterval(() => {
     spinnerIdx++
     const cols = process.stderr.columns || process.stdout.columns || 80
+    const rows = process.stderr.rows || process.stdout.rows || 24
     const events = parseEvents(runDir, eventTailers)
     const state = derivePipelineState(events, runDir)
-    const frame = buildFrame(state, transcripts, spinnerIdx, cols)
+    const frame = buildFrame(state, transcripts, spinnerIdx, cols, rows)
 
     // Atomic write: home + frame + clear below
     write(HOME + frame + "\n" + CLEAR_BELOW)
@@ -520,8 +698,40 @@ export function renderDashboard(opts: DashboardOptions): void {
       }
       if (key === "q" || key === "\x03") {
         clearInterval(renderInterval)
-        write(SHOW_CURSOR + "\n")
+        write(ALT_SCREEN_OFF + SHOW_CURSOR)
         process.exit(0)
+      }
+      // Scroll up (arrow up or k)
+      if (key === "\x1b[A" || key === "k") {
+        if (focusedAgent) {
+          const cur = scrollOffsets.get(focusedAgent) ?? 0
+          scrollOffsets.set(focusedAgent, cur + 3)
+        }
+      }
+      // Scroll down (arrow down or j)
+      if (key === "\x1b[B" || key === "j") {
+        if (focusedAgent) {
+          const cur = scrollOffsets.get(focusedAgent) ?? 0
+          scrollOffsets.set(focusedAgent, Math.max(0, cur - 3))
+        }
+      }
+      // Tab to cycle focus between agent panels
+      if (key === "\t") {
+        const events = parseEvents(runDir, eventTailers)
+        const state = derivePipelineState(events, runDir)
+        const agentIds = Array.from(state.activeAgents.keys())
+        if (agentIds.length > 1) {
+          const curIdx = focusedAgent ? agentIds.indexOf(focusedAgent) : -1
+          focusedAgent = agentIds[(curIdx + 1) % agentIds.length]
+        }
+      }
+      // Home: scroll to bottom (latest)
+      if (key === "\x1b[H" || key === "g") {
+        if (focusedAgent) scrollOffsets.set(focusedAgent, 0)
+      }
+      // End: scroll to top (oldest)
+      if (key === "\x1b[F" || key === "G") {
+        if (focusedAgent) scrollOffsets.set(focusedAgent, 99999)
       }
     })
   }
@@ -538,10 +748,11 @@ export function renderDashboard(opts: DashboardOptions): void {
       clearInterval(renderInterval)
       // One final render
       const cols = process.stderr.columns || process.stdout.columns || 80
+      const rows = process.stderr.rows || process.stdout.rows || 24
       const events = parseEvents(runDir, eventTailers)
       const state = derivePipelineState(events, runDir)
-      const frame = buildFrame(state, transcripts, spinnerIdx, cols)
-      write(HOME + frame + "\n" + CLEAR_BELOW + SHOW_CURSOR)
+      const frame = buildFrame(state, transcripts, spinnerIdx, cols, rows)
+      write(HOME + frame + "\n" + CLEAR_BELOW + ALT_SCREEN_OFF + SHOW_CURSOR)
     }, 1000)
   })
 }

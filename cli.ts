@@ -14,7 +14,7 @@
  *   tsx cli.ts plugins update
  */
 
-import { existsSync, mkdirSync, readFileSync, copyFileSync, unlinkSync, writeFileSync, readdirSync } from "fs"
+import { existsSync, mkdirSync, readFileSync, copyFileSync, unlinkSync, writeFileSync, readdirSync, statSync, symlinkSync } from "fs"
 import { spawnSync, execSync }                        from "child_process"
 import { join, resolve }                              from "path"
 import { homedir }                                    from "os"
@@ -554,15 +554,16 @@ async function cli(): Promise<void> {
     const storage = await loadStorage()
     const { workflow } = await import(await storage.resolveWorkflow(workflowRef) ?? resolve(workflowRef))
 
+    const runDir = join("/tmp/orchestrator", runId)
+
     if (quiet) {
       await resume({ workflow, runId, choice, overrides })
       return
     }
 
     process.stdout.write = (() => true) as any
-    const runDir = join("/tmp/orchestrator", runId)
     renderDashboard({
-      runDir,
+      runDir: runDir,
       runWorkflow: () => resume({ workflow, runId, choice, overrides }),
       loadMapper: loadMapperForProvider,
     })
@@ -576,14 +577,77 @@ async function cli(): Promise<void> {
     const runDir = join("/tmp/orchestrator", runId)
     if (!existsSync(runDir)) { console.error(`Run directory not found: ${runDir}`); process.exit(1) }
 
+    // ── Discover sub-workflows
+    const subDirs: Array<{ name: string; dir: string }> = []
+    try {
+      for (const entry of readdirSync(runDir)) {
+        if (entry.startsWith("sub-")) {
+          const subDir = join(runDir, entry)
+          if (existsSync(subDir) && statSync(subDir).isDirectory()) {
+            subDirs.push({ name: entry.replace(/^sub-/, ""), dir: subDir })
+          }
+        }
+      }
+    } catch {}
+
+    // ── Parse events for timeline
+    type EvtSummary = { ts: string; event: string; nodeId?: string; extra: string; isSub: boolean; subName?: string }
+    function parseEventsFile(filePath: string, isSub: boolean, subName?: string): EvtSummary[] {
+      if (!existsSync(filePath)) return []
+      const summaries: EvtSummary[] = []
+      for (const line of readFileSync(filePath, "utf8").trim().split("\n")) {
+        if (!line) continue
+        try {
+          const e = JSON.parse(line)
+          const ts = (e.ts as string)?.slice(11, 19) ?? ""
+          const evt = e.event as string
+          const nodeId = e.nodeId as string | undefined
+          let extra = ""
+          if (evt === "PostAgent") {
+            const dur = Math.round((e.duration_ms as number ?? 0) / 1000)
+            extra = `choice=${e.choice} ${dur}s`
+          }
+          if (evt === "GuardrailFail") extra = e.reason as string ?? ""
+          if (evt === "Paused") extra = e.reason as string ?? ""
+          if (evt === "RunEnd") extra = `terminal=${e.terminal}`
+          if (evt === "SubworkflowStart") extra = `→ ${e.innerWorkflowId} (${e.innerNodeCount} nodes)`
+          if (evt === "SubworkflowEnd") extra = `keys=[${(e.innerContextKeys as string[])?.join(", ") ?? ""}]`
+          summaries.push({ ts, event: evt, nodeId, extra, isSub, subName })
+        } catch {}
+      }
+      return summaries
+    }
+
+    const outerEvents = parseEventsFile(join(runDir, "events.ndjson"), false)
+    const subEventsByName = new Map<string, EvtSummary[]>()
+    for (const sub of subDirs) {
+      subEventsByName.set(sub.name, parseEventsFile(join(sub.dir, "events.ndjson"), true, sub.name))
+    }
+
+    // ── Determine overall status
     const hasPause = await storage.pauseExists(runDir)
-    let hasContext = false
-    try { await storage.loadContext(runDir); hasContext = true } catch {}
+    const subPauses: Array<{ name: string; nodeId: string; reason: string }> = []
+    for (const sub of subDirs) {
+      if (await storage.pauseExists(sub.dir)) {
+        try {
+          const p = await storage.loadPause(sub.dir)
+          subPauses.push({ name: sub.name, nodeId: p.nodeId, reason: p.reason ?? "" })
+        } catch {}
+      }
+    }
 
-    console.log(`\n  Run: ${runId}`)
-    console.log(`  Dir: ${runDir}`)
-    console.log(`  Status: ${hasPause ? "PAUSED" : "completed"}\n`)
+    const outerTerminal = outerEvents.find(e => e.event === "RunEnd")?.extra ?? ""
+    let overallStatus = hasPause ? "PAUSED" : outerTerminal.includes("done") ? "completed" : outerTerminal.includes("failed") ? "FAILED" : "running"
+    if (overallStatus === "completed" && subPauses.length > 0) {
+      overallStatus = "completed (sub-workflow paused)"
+    }
 
+    // ── Print header
+    console.log(`\n  Run:    ${runId}`)
+    console.log(`  Dir:    ${runDir}`)
+    console.log(`  Status: ${overallStatus}\n`)
+
+    // ── Outer pause
     if (hasPause) {
       const paused = await storage.loadPause(runDir)
       console.log(`  Paused at: ${paused.nodeId}`)
@@ -595,6 +659,51 @@ async function cli(): Promise<void> {
       console.log()
     }
 
+    // ── Sub-workflow pauses
+    for (const sp of subPauses) {
+      console.log(`  ⚠ Sub-workflow "${sp.name}" paused at node "${sp.nodeId}"`)
+      if (sp.reason) console.log(`    Reason: ${sp.reason}`)
+      console.log()
+    }
+
+    // ── Timeline (interleaved outer + sub events)
+    console.log(`  Timeline:`)
+    // Print outer events, inserting sub-workflow events at SubworkflowStart/End boundaries
+    const printedSubs = new Set<string>()
+    for (const evt of outerEvents) {
+      const node = evt.nodeId ? ` ${evt.nodeId}` : ""
+      const extra = evt.extra ? `  ${evt.extra}` : ""
+      console.log(`    ${evt.ts}  ${evt.event}${node}${extra}`)
+
+      // After SubworkflowStart, print that sub-workflow's events indented
+      if (evt.event === "SubworkflowStart") {
+        const innerName = evt.extra.match(/→ (\S+)/)?.[1]
+        if (innerName && subEventsByName.has(innerName) && !printedSubs.has(innerName)) {
+          printedSubs.add(innerName)
+          const subEvts = subEventsByName.get(innerName)!
+          for (const se of subEvts) {
+            const sNode = se.nodeId ? ` ${se.nodeId}` : ""
+            const sExtra = se.extra ? `  ${se.extra}` : ""
+            console.log(`      ${se.ts}  ${se.event}${sNode}${sExtra}`)
+          }
+        }
+      }
+    }
+    // Print any sub-workflows not anchored to a SubworkflowStart
+    for (const [name, evts] of subEventsByName) {
+      if (printedSubs.has(name)) continue
+      console.log(`    ── sub: ${name}`)
+      for (const se of evts) {
+        const sNode = se.nodeId ? ` ${se.nodeId}` : ""
+        const sExtra = se.extra ? `  ${se.extra}` : ""
+        console.log(`      ${se.ts}  ${se.event}${sNode}${sExtra}`)
+      }
+    }
+    console.log()
+
+    // ── Context
+    let hasContext = false
+    try { await storage.loadContext(runDir); hasContext = true } catch {}
     if (hasContext) {
       const ctx = await storage.loadContext(runDir)
       const keys = Object.keys(ctx)
@@ -607,11 +716,23 @@ async function cli(): Promise<void> {
       console.log()
     }
 
+    // ── Log (outer)
     const logPath = join(runDir, "orchestrator.log")
     if (existsSync(logPath)) {
       const lines = readFileSync(logPath, "utf8").trim().split("\n")
       const tail = lines.slice(-10)
       console.log(`  Log (last ${tail.length} of ${lines.length} lines):`)
+      for (const line of tail) console.log(`    ${line}`)
+      console.log()
+    }
+
+    // ── Sub-workflow logs
+    for (const sub of subDirs) {
+      const subLog = join(sub.dir, "orchestrator.log")
+      if (!existsSync(subLog)) continue
+      const lines = readFileSync(subLog, "utf8").trim().split("\n")
+      const tail = lines.slice(-10)
+      console.log(`  Sub-workflow "${sub.name}" log (last ${tail.length} of ${lines.length} lines):`)
       for (const line of tail) console.log(`    ${line}`)
       console.log()
     }
@@ -700,6 +821,23 @@ Examples:
 const cmd = process.argv[2]
 const isQuiet = process.argv.includes("--quiet")
 const isDashboard = (cmd === "run" || cmd === "resume") && !isQuiet
+
+// Sub-workflow resume: bridge the "sub-" directory convention before tmux forks.
+// The core's resume() looks at /tmp/orchestrator/<runId> but sub-workflows live
+// at /tmp/orchestrator/<parent>/sub-<name>. Create a symlink so the core finds it.
+if (cmd === "resume") {
+  const resumeRunId = (() => { const i = process.argv.indexOf("--run"); return i >= 0 ? process.argv[i + 1] : null })()
+  if (resumeRunId?.includes("/")) {
+    const expectedDir = join("/tmp/orchestrator", resumeRunId)
+    if (!existsSync(expectedDir)) {
+      const parts = resumeRunId.split("/")
+      const subDir = join("/tmp/orchestrator", parts[0], `sub-${parts.slice(1).join("/")}`)
+      if (existsSync(subDir)) {
+        try { symlinkSync(subDir, expectedDir) } catch {}
+      }
+    }
+  }
+}
 
 // Dashboard mode renders its own TUI — skip tmux so it stays in the foreground
 if (!cmd || cmd === "list" || cmd === "status" || cmd === "help" || cmd === "plugins" || isDashboard) cli().catch(err => { console.error(err); process.exit(1) })
