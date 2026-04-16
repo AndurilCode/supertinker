@@ -1,5 +1,5 @@
 import { execSync } from "child_process"
-import { existsSync, mkdirSync } from "fs"
+import { existsSync, mkdirSync, readdirSync, rmdirSync } from "fs"
 import { join, resolve } from "path"
 import type { Hook, HookEvent, HookDirective, Context } from "../../../supertinker.js"
 
@@ -145,37 +145,39 @@ export const hook: Hook = {
 
       // Merge each branch's changes back
       for (const [target, { branch, path: wtPath }] of fork.branches) {
+        let skipCleanup = false
         try {
           // Check if the branch has any changes
           const diffStat = git(`diff ${fork.baseBranch}...${branch} --stat`, fork.baseDir)
           if (!diffStat) {
             process.stderr.write(`[fork-worktree] ${target}: no changes to merge\n`)
-            continue
-          }
-
-          // Merge the branch
-          try {
-            git(`merge --no-ff -m "merge fork branch: ${target}" ${branch}`, fork.baseDir)
-            process.stderr.write(`[fork-worktree] ${target}: merged successfully\n`)
-          } catch (mergeErr) {
-            // Abort the failed merge and record the error
-            try { git("merge --abort", fork.baseDir) } catch {}
-            errors.push(`${target}: merge conflict — branch "${branch}" preserved for manual resolution`)
-            process.stderr.write(`[fork-worktree] ${target}: merge conflict, branch preserved\n`)
-            continue  // skip cleanup for this branch
+          } else {
+            // Merge the branch
+            try {
+              git(`merge --no-ff -m "merge fork branch: ${target}" ${branch}`, fork.baseDir)
+              process.stderr.write(`[fork-worktree] ${target}: merged successfully\n`)
+            } catch (mergeErr) {
+              // Abort the failed merge and record the error
+              try { git("merge --abort", fork.baseDir) } catch {}
+              errors.push(`${target}: merge conflict — branch "${branch}" preserved for manual resolution`)
+              process.stderr.write(`[fork-worktree] ${target}: merge conflict, branch preserved\n`)
+              skipCleanup = true
+            }
           }
         } catch (err) {
           errors.push(`${target}: ${err}`)
           process.stderr.write(`[fork-worktree] ${target}: error during merge: ${err}\n`)
-          continue
+          skipCleanup = true
         }
 
-        // Clean up worktree and branch (only if merge succeeded)
-        try {
-          git(`worktree remove "${wtPath}" --force`, fork.baseDir)
-          git(`branch -D "${branch}"`, fork.baseDir)
-        } catch (cleanupErr) {
-          process.stderr.write(`[fork-worktree] WARN: cleanup failed for ${target}: ${cleanupErr}\n`)
+        // Clean up worktree and branch (skip only on merge conflict to allow manual resolution)
+        if (!skipCleanup) {
+          try {
+            git(`worktree remove "${wtPath}" --force`, fork.baseDir)
+            git(`branch -D "${branch}"`, fork.baseDir)
+          } catch (cleanupErr) {
+            process.stderr.write(`[fork-worktree] WARN: cleanup failed for ${target}: ${cleanupErr}\n`)
+          }
         }
 
         nodeToFork.delete(target)
@@ -186,6 +188,15 @@ export const hook: Hook = {
         const ctx = event.context as Context
         ctx._fork_merge_errors = errors.join("\n")
       }
+
+      // Clean up parent worktree directory if empty
+      try {
+        const remaining = readdirSync(fork.worktreeDir)
+        if (remaining.length === 0) {
+          rmdirSync(fork.worktreeDir)
+          process.stderr.write(`[fork-worktree] cleaned up worktree dir: ${fork.worktreeDir}\n`)
+        }
+      } catch {}
 
       activeForks.delete(forkKey)
 
