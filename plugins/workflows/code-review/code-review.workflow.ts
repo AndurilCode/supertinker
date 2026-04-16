@@ -131,7 +131,9 @@ A concise executive summary:
 - Key themes across the three lenses
 - Recommended priority order for the author
 
-Keep it actionable. No filler.`,
+Keep it actionable. No filler.
+
+IMPORTANT: Write the full review to a file called "code-review.md" in the working directory. This file IS your deliverable — do not just print it to the conversation.`,
         options: { done: "done" },
       },
       { id: "done", type: "done" },
