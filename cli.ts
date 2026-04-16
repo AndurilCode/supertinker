@@ -495,6 +495,36 @@ async function loadCommandPlugin(name: string): Promise<CommandPlugin | null> {
   return null
 }
 
+async function discoverCommandPlugins(): Promise<Array<{ name: string; description: string; usage?: string }>> {
+  const BUILTIN_DIR = resolve(join(new URL(import.meta.url).pathname, ".."))
+  const USER_DIR = join(homedir(), ".supertinker")
+  const PROJECT_DIR = join(process.cwd(), ".supertinker")
+  const SEARCH_DIRS = [PROJECT_DIR, USER_DIR, BUILTIN_DIR]
+
+  const seen = new Set<string>()
+  const results: Array<{ name: string; description: string; usage?: string }> = []
+
+  for (const base of SEARCH_DIRS) {
+    const dir = join(base, "commands")
+    if (!existsSync(dir)) continue
+    let files: string[]
+    try { files = readdirSync(dir).filter((f: string) => f.endsWith(".ts") || f.endsWith(".js")) } catch { continue }
+    for (const file of files) {
+      const name = file.replace(/\.(ts|js)$/, "")
+      if (seen.has(name)) continue
+      try {
+        const mod = await import(join(dir, file))
+        const cmd = mod.command ?? mod.default?.command
+        if (cmd && typeof cmd.handler === "function" && cmd.name) {
+          seen.add(name)
+          results.push({ name: cmd.name, description: cmd.description ?? "", usage: cmd.usage })
+        }
+      } catch {}
+    }
+  }
+  return results
+}
+
 // ─── MAPPER LOADER
 
 async function loadMapperForProvider(provider: string): Promise<TranscriptMapper | null> {
@@ -826,13 +856,21 @@ async function cli(): Promise<void> {
   }
 
   // ── Command plugins: try to dispatch to an installed command plugin
-  if (cmd) {
+  if (cmd && cmd !== "--help" && cmd !== "-h") {
     const loaded = await loadCommandPlugin(cmd)
     if (loaded) {
       await loaded.handler(argv.slice(1), get)
       return
     }
   }
+
+  // ── Help / no command: print usage with discovered command plugins
+  const commandPlugins = await discoverCommandPlugins()
+  const pluginSection = commandPlugins.length > 0
+    ? "\n\nInstalled command plugins:\n" + commandPlugins.map(p =>
+        `  ${p.name.padEnd(10)}${p.description}${p.usage ? `\n${"".padEnd(12)}Usage: ${p.usage}` : ""}`
+      ).join("\n")
+    : ""
 
   console.log(`supertinker — minimal agent orchestrator
 
@@ -845,7 +883,7 @@ Commands:
   plugins list [--installed]          show available/installed plugins
   plugins install [<name>...] [--global|--local]   install plugins
   plugins uninstall <name>... --global|--local     remove plugins
-  plugins update                      pull latest + re-copy installed
+  plugins update                      pull latest + re-copy installed${pluginSection}
 
 Examples:
   tsx cli.ts run --prompt "Build a REST API"

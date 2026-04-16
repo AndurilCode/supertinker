@@ -20,7 +20,10 @@ $ST list --hooks                                     # discovered hooks
 $ST status --run <runId>                             # inspect run state
 $ST resume --run <runId> --choice <label> --workflow <name>  # resume paused
 $ST resume --run <runId> --choice <label> --workflow <name> --provider copilot  # resume with override
+$ST --help                                           # all commands incl. installed command plugins
 ```
+
+Plugins can add custom CLI commands (e.g. `schedule`). Run `$ST --help` to see all available commands including installed command plugins.
 
 ## Monitoring
 
@@ -113,14 +116,14 @@ supertinker is extensible through plugins. The only built-in is `providers/claud
 
 Plugins install to `~/.supertinker/` (global) or `.supertinker/` (project-local). Project-local overrides global. To see what's available: `$ST plugins list`.
 
-Manual overrides still work: drop any `.ts` file into `.supertinker/hooks/`, `.supertinker/providers/`, `.supertinker/workflows/`, or `.supertinker/storage/` in your project.
+Manual overrides still work: drop any `.ts` file into `.supertinker/hooks/`, `.supertinker/providers/`, `.supertinker/workflows/`, `.supertinker/storage/`, or `.supertinker/commands/` in your project.
 
 ## Building Plugins
 
-When the user wants to **create** a new workflow, provider, hook, or storage adapter — or asks how any of those work — invoke the `supertinker-doc` skill:
+When the user wants to **create** a new workflow, provider, hook, storage adapter, or CLI command — or asks how any of those work — invoke the `supertinker-doc` skill:
 
 ```
 Skill({ skill: "supertinker-doc" })
 ```
 
-`supertinker-doc` contains the full authoring reference: schemas, interfaces, examples, search-path rules, and the plugin manifest format.
+`supertinker-doc` contains the full authoring reference: schemas, interfaces, examples, search-path rules, the plugin manifest format, and command plugin creation.
