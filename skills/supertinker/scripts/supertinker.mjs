@@ -800,7 +800,7 @@ export const mapTranscript: TranscriptMapper = (line: string) => {
   return null
 }
 ` };
-var BUILD_STAMP = "2026-04-16T13:46:19.073Z";
+var BUILD_STAMP = "2026-04-16T15:23:11.800Z";
 var userDir = join2(homedir2(), ".supertinker");
 var stampFile = join2(userDir, ".builtin-stamp");
 var needsExtract = !existsSync2(stampFile) || readFileSync2(stampFile, "utf8").trim() !== BUILD_STAMP;
