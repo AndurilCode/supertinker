@@ -513,7 +513,9 @@ async function cli(): Promise<void> {
       return
     }
 
-    // Dashboard mode: discover runDir from /tmp/orchestrator/
+    // Dashboard mode: suppress stdout writes and prevent child processes
+    // (claude CLI) from writing to /dev/tty, which breaks Ink's rendering.
+    process.stdout.write = (() => true) as any
     const prefix = workflow.id
     const orchestratorDir = "/tmp/orchestrator"
 
@@ -557,6 +559,7 @@ async function cli(): Promise<void> {
       return
     }
 
+    process.stdout.write = (() => true) as any
     const runDir = join("/tmp/orchestrator", runId)
     renderDashboard({
       runDir,
@@ -695,5 +698,9 @@ Examples:
 // ─── ENTRYPOINT
 
 const cmd = process.argv[2]
-if (!cmd || cmd === "list" || cmd === "status" || cmd === "help" || cmd === "plugins") cli().catch(err => { console.error(err); process.exit(1) })
+const isQuiet = process.argv.includes("--quiet")
+const isDashboard = (cmd === "run" || cmd === "resume") && !isQuiet
+
+// Dashboard mode renders its own TUI — skip tmux so it stays in the foreground
+if (!cmd || cmd === "list" || cmd === "status" || cmd === "help" || cmd === "plugins" || isDashboard) cli().catch(err => { console.error(err); process.exit(1) })
 else if (ensureTmux()) cli().catch(err => { console.error(err); process.exit(1) })

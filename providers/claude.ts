@@ -20,7 +20,7 @@ interface AgentResult {
 
 function run(command: string, args: string[], cwd: string, logFile: string): Promise<string> {
   return new Promise((res, rej) => {
-    const proc = spawn(command, args, { cwd, env: process.env })
+    const proc = spawn(command, args, { cwd, env: process.env, detached: true, stdio: ["pipe", "pipe", "pipe"] })
     let out = "", err = ""
     proc.stdout.on("data", (chunk: Buffer) => {
       const txt = chunk.toString(); out += txt
@@ -45,11 +45,13 @@ export async function invoke(ctx: ProviderContext): Promise<AgentResult> {
   const sessionId = randomUUID()
 
   // Write meta sidecar for dashboard
+  // Find the transcript by searching for the sessionId.jsonl file across Claude project dirs
+  const claudeProjects = `${process.env.HOME}/.claude/projects`
   const metaPath = ctx.logFile.replace(/\.log$/, ".meta.json")
-  writeFileSync(metaPath, JSON.stringify({
-    transcriptPath: `${process.env.HOME}/.claude/projects/${sessionId}.jsonl`,
-    provider: "claude",
-  }))
+  const transcriptFile = `${sessionId}.jsonl`
+
+  // Write initial meta with a glob pattern — dashboard will resolve it
+  writeFileSync(metaPath, JSON.stringify({ transcriptFile, sessionId, claudeProjects, provider: "claude" }))
 
   const args = [
     "-p", ctx.userPrompt,
@@ -71,7 +73,7 @@ export async function invoke(ctx: ProviderContext): Promise<AgentResult> {
   else throw new Error(`Unexpected Claude output shape: ${raw.slice(0, 200)}`)
 
   result.transcriptPath = parsed.session_id
-    ? `${process.env.HOME}/.claude/projects/${parsed.session_id}.jsonl`
+    ? `${sessionId}.jsonl`
     : undefined
 
   return result
