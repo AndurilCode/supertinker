@@ -38,6 +38,13 @@ PERFORMANCE:
   Explorer/analyst agents: add "Keep output under 2000 words" to systemPrompt, use slice to limit context.
   Implementer agents: parallelize with fork/join — never serialize independent work.
 
+SEPARATION OF CONCERNS in review loops:
+  - Design/architect nodes produce PLANS and SPECIFICATIONS (text), not source code. Their output is a description of what to build.
+  - Implementer nodes write actual files to disk. Their output is a brief status of what was written.
+  - Reviewer nodes in a design→review loop must review the DESIGN (feasibility, completeness, correctness of the plan) — never demand source code from a design node.
+  - Reviewer nodes in an implement→review loop review the FILES ON DISK (read them via filesystem), not the agent output text.
+  - NEVER ask a design node to include verbatim source code in its output — that's the implementer's job.
+
 RULES:
   - Match complexity to task — don't over-engineer simple tasks
   - Use "claude" as command, "sonnet" as model for all agents
