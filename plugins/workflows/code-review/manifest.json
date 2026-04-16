@@ -1,0 +1,7 @@
+{
+  "name": "code-review",
+  "type": "workflow",
+  "description": "Multi-lens code review: quality, security, and project rules — produces inline comments and summary",
+  "files": ["code-review.workflow.ts"],
+  "version": "1.0.0"
+}
