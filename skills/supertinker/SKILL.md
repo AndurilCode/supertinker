@@ -26,17 +26,21 @@ $ST resume --run <runId> --choice <label> --workflow <name> --provider copilot  
 
 Runs are long-lived (minutes per agent node). Use the `status` command as your primary inspection tool.
 
-### Claude Code — use Monitor + status
+### Claude Code — use background + log tail
+
+**Important:** For workflows with fork nodes, the `$ST run` parent process may exit (code 0) while spawned agent processes are still running. Do NOT rely on `run_in_background` task notifications to detect completion. Instead, monitor the orchestrator log for terminal events.
 
 ```bash
 $ST run --prompt "task" &
 ```
-Then monitor with a log tail:
-```
-Monitor(command: "tail -f $(ls -td /tmp/orchestrator/*/ | head -1)/orchestrator.log | grep --line-buffered -E 'START|CHOICE|PAUSED|DONE|FAILED|ERROR'")
+Then monitor with a log tail (run in background):
+```bash
+tail -f $(ls -td /tmp/orchestrator/*/ | head -1)/orchestrator.log | grep --line-buffered -E 'START|CHOICE|PAUSED|DONE|FAILED|ERROR'
 ```
 
-When the monitor reports completion or pause, inspect the run:
+**Completion signals in the log:** `DONE ✓` or `FAILED ✗` mean the run finished. `PAUSED` means human input needed. If you only see `INVOKE` lines, agents are still working — check with `ps aux | grep "session-id"` to confirm.
+
+When the log reports completion or pause, inspect the run:
 ```bash
 $ST status --run <runId>
 ```
@@ -86,6 +90,22 @@ $ST plugins update                                   # pull latest + re-copy ins
 ```
 
 When the user asks what plugins are available, run `$ST plugins list` and present the results. For installation in a non-interactive context (Claude Code), always use named install with `--global` or `--local` flag — do not attempt the interactive picker.
+
+### Manual plugin install fallback
+
+If `$ST plugins install` fails (e.g. missing runtime dependency), install manually by copying the plugin file to the correct search-path directory:
+
+```bash
+# Global install
+mkdir -p ~/.supertinker/workflows/  # or hooks/, providers/, storage/
+cp plugins/workflows/<name>/<name>.workflow.ts ~/.supertinker/workflows/
+
+# Project-local install
+mkdir -p .supertinker/workflows/
+cp plugins/workflows/<name>/<name>.workflow.ts .supertinker/workflows/
+```
+
+Verify with `$ST list` (workflows) or `$ST list --hooks` (hooks).
 
 ## Plugins
 

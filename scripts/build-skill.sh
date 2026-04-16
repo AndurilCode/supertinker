@@ -106,8 +106,10 @@ async function main() {
     const cliPath = resolve(\"${REPO_ROOT}\", \"cli.ts\")
     const raw = process.argv.slice(2)
     const escaped = raw.map(function(s: string) { return \"'\" + s.replace(/'/g, \"'\\\\\\\\''\") + \"'\" }).join(\" \")
+    // Try bun first (self-contained), fall back to tsx for dev environments
+    const runner = (() => { try { require(\"child_process\").execSync(\"which bun\", { stdio: \"ignore\" }); return \"bun\" } catch { return \"tsx\" } })()
     try {
-      execSync(\"tsx \" + cliPath + \" \" + escaped, { stdio: \"inherit\", cwd: process.cwd() })
+      execSync(runner + \" \" + cliPath + \" \" + escaped, { stdio: \"inherit\", cwd: process.cwd() })
     } catch (e: any) {
       if (e.status) process.exit(e.status)
     }

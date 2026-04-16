@@ -800,7 +800,7 @@ export const mapTranscript: TranscriptMapper = (line: string) => {
   return null
 }
 ` };
-var BUILD_STAMP = "2026-04-16T15:23:11.800Z";
+var BUILD_STAMP = "2026-04-16T15:39:53.157Z";
 var userDir = join2(homedir2(), ".supertinker");
 var stampFile = join2(userDir, ".builtin-stamp");
 var needsExtract = !existsSync2(stampFile) || readFileSync2(stampFile, "utf8").trim() !== BUILD_STAMP;
@@ -860,8 +860,16 @@ async function main() {
     const escaped = raw.map(function(s) {
       return "'" + s.replace(/'/g, "'\\''") + "'";
     }).join(" ");
+    const runner = (() => {
+      try {
+        __require("child_process").execSync("which bun", { stdio: "ignore" });
+        return "bun";
+      } catch {
+        return "tsx";
+      }
+    })();
     try {
-      execSync("tsx " + cliPath + " " + escaped, { stdio: "inherit", cwd: process.cwd() });
+      execSync(runner + " " + cliPath + " " + escaped, { stdio: "inherit", cwd: process.cwd() });
     } catch (e) {
       if (e.status)
         process.exit(e.status);
