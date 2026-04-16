@@ -20,6 +20,8 @@ import { join, resolve }                              from "path"
 import { homedir }                                    from "os"
 import { run, resume, buildCatalog, loadStorage, loadHooks } from "./supertinker.js"
 import type { Context, ProviderOverrides }                   from "./supertinker.js"
+import { renderDashboard } from "./dashboard.js"
+import type { TranscriptMapper } from "./display-protocol.js"
 
 // ─── TMUX AUTO-LAUNCH
 
@@ -463,6 +465,29 @@ function pluginsUpdate(): void {
   console.log(`\n${updated} plugin(s) updated.`)
 }
 
+// ─── MAPPER LOADER
+
+async function loadMapperForProvider(provider: string): Promise<TranscriptMapper | null> {
+  const BUILTIN_DIR = resolve(join(new URL(import.meta.url).pathname, ".."))
+  const USER_DIR = join(homedir(), ".supertinker")
+  const PROJECT_DIR = join(process.cwd(), ".supertinker")
+  const SEARCH_DIRS = [PROJECT_DIR, USER_DIR, BUILTIN_DIR]
+
+  for (const base of SEARCH_DIRS) {
+    for (const ext of ["ts", "js"]) {
+      const p = join(base, "providers", `${provider}.${ext}`)
+      if (existsSync(p)) {
+        try {
+          const mod = await import(p)
+          const mapper = mod.mapTranscript ?? mod.default?.mapTranscript
+          if (typeof mapper === "function") return mapper
+        } catch {}
+      }
+    }
+  }
+  return null
+}
+
 // ─── CLI
 
 async function cli(): Promise<void> {
@@ -475,24 +500,69 @@ async function cli(): Promise<void> {
     const prompt       = get("--prompt")
     const provider     = get("--provider")
     const model        = get("--model")
+    const quiet        = argv.includes("--quiet")
     const overrides: ProviderOverrides = { ...(provider && { provider }), ...(model && { model }) }
     const storage = await loadStorage()
     const workflowPath = await storage.resolveWorkflow(workflowRef) ?? resolve(workflowRef)
     const { workflow } = await import(workflowPath)
     const initialContext: Context = { catalog: await buildCatalog(storage), cwd: process.cwd() }
     if (prompt) initialContext.task = prompt
-    await run({ workflow, initialContext, overrides })
+
+    if (quiet) {
+      await run({ workflow, initialContext, overrides })
+      return
+    }
+
+    // Dashboard mode: discover runDir from /tmp/orchestrator/
+    const prefix = workflow.id
+    const orchestratorDir = "/tmp/orchestrator"
+
+    const discoverRunDir = (): Promise<string> => new Promise((res) => {
+      const before = new Set(existsSync(orchestratorDir) ? readdirSync(orchestratorDir) : [])
+      const interval = setInterval(() => {
+        if (!existsSync(orchestratorDir)) return
+        for (const entry of readdirSync(orchestratorDir)) {
+          if (!before.has(entry) && entry.startsWith(prefix)) {
+            clearInterval(interval)
+            res(join(orchestratorDir, entry))
+            return
+          }
+        }
+      }, 100)
+    })
+
+    const runDirPromise = discoverRunDir()
+    const workflowPromise = run({ workflow, initialContext, overrides })
+    const resolvedRunDir = await runDirPromise
+
+    renderDashboard({
+      runDir: resolvedRunDir,
+      runWorkflow: () => workflowPromise,
+      loadMapper: loadMapperForProvider,
+    })
     return
   }
 
   if (cmd === "resume") {
     const runId = get("--run"), choice = get("--choice"), workflowRef = get("--workflow")
     const provider = get("--provider"), model = get("--model")
+    const quiet = argv.includes("--quiet")
     const overrides: ProviderOverrides = { ...(provider && { provider }), ...(model && { model }) }
     if (!runId || !choice || !workflowRef) { console.error("Usage: supertinker resume --run <id> --choice <label> --workflow <name|path>"); process.exit(1) }
     const storage = await loadStorage()
     const { workflow } = await import(await storage.resolveWorkflow(workflowRef) ?? resolve(workflowRef))
-    await resume({ workflow, runId, choice, overrides })
+
+    if (quiet) {
+      await resume({ workflow, runId, choice, overrides })
+      return
+    }
+
+    const runDir = join("/tmp/orchestrator", runId)
+    renderDashboard({
+      runDir,
+      runWorkflow: () => resume({ workflow, runId, choice, overrides }),
+      loadMapper: loadMapperForProvider,
+    })
     return
   }
 
@@ -604,8 +674,8 @@ async function cli(): Promise<void> {
   console.log(`supertinker — minimal agent orchestrator
 
 Commands:
-  run       [--workflow <name|path>] --prompt <text>   (default: meta)
-  resume    --run <runId> --choice <label> --workflow <name|path>
+  run       [--workflow <name|path>] --prompt <text> [--quiet]   (default: meta)
+  resume    --run <runId> --choice <label> --workflow <name|path> [--quiet]
   status    --run <runId>   inspect a run's state and context
   list             show available workflows
   list --hooks     show discovered hooks
