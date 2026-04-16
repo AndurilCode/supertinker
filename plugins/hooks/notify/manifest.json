@@ -1,0 +1,7 @@
+{
+  "name": "notify",
+  "type": "hook",
+  "description": "macOS system notifications for agent completion, pauses, and workflow end",
+  "files": ["notify.ts"],
+  "version": "1.0.0"
+}
