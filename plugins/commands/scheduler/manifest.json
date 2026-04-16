@@ -1,0 +1,7 @@
+{
+  "name": "scheduler",
+  "type": "command",
+  "description": "Schedule supertinker workflows via launchd (macOS)",
+  "files": ["schedule.ts"],
+  "version": "1.0.0"
+}

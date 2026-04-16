@@ -45,7 +45,7 @@ function ensureTmux(): boolean {
 
 interface PluginManifest {
   name: string
-  type: "hook" | "provider" | "workflow" | "storage"
+  type: "hook" | "provider" | "workflow" | "storage" | "command"
   description: string
   files: string[]
   version: string
@@ -62,9 +62,16 @@ interface InstalledJson {
   plugins: InstalledEntry[]
 }
 
-const PLUGIN_TYPES = ["hook", "provider", "workflow", "storage"] as const
+export interface CommandPlugin {
+  name:        string
+  description: string
+  usage?:      string
+  handler:     (args: string[], get: (flag: string) => string | undefined) => Promise<void>
+}
+
+const PLUGIN_TYPES = ["hook", "provider", "workflow", "storage", "command"] as const
 const TYPE_TO_DIR: Record<string, string> = {
-  hook: "hooks", provider: "providers", workflow: "workflows", storage: "storage",
+  hook: "hooks", provider: "providers", workflow: "workflows", storage: "storage", command: "commands",
 }
 
 const USER_HOME = join(homedir(), ".supertinker")
@@ -155,7 +162,7 @@ function pluginsList(onlyInstalled: boolean): void {
   for (const m of available) grouped.get(m.type)!.push(m)
 
   const typeLabels: Record<string, string> = {
-    hook: "Hooks", provider: "Providers", workflow: "Workflows", storage: "Storage",
+    hook: "Hooks", provider: "Providers", workflow: "Workflows", storage: "Storage", command: "Commands",
   }
 
   for (const type of PLUGIN_TYPES) {
@@ -463,6 +470,29 @@ function pluginsUpdate(): void {
   saveInstalled(localDir, localInstalled)
 
   console.log(`\n${updated} plugin(s) updated.`)
+}
+
+// ─── COMMAND PLUGIN LOADER
+
+async function loadCommandPlugin(name: string): Promise<CommandPlugin | null> {
+  const BUILTIN_DIR = resolve(join(new URL(import.meta.url).pathname, ".."))
+  const USER_DIR = join(homedir(), ".supertinker")
+  const PROJECT_DIR = join(process.cwd(), ".supertinker")
+  const SEARCH_DIRS = [PROJECT_DIR, USER_DIR, BUILTIN_DIR]
+
+  for (const base of SEARCH_DIRS) {
+    for (const ext of ["ts", "js"]) {
+      const p = join(base, "commands", `${name}.${ext}`)
+      if (existsSync(p)) {
+        try {
+          const mod = await import(p)
+          const cmd = mod.command ?? mod.default?.command
+          if (cmd && typeof cmd.handler === "function" && cmd.name) return cmd as CommandPlugin
+        } catch {}
+      }
+    }
+  }
+  return null
 }
 
 // ─── MAPPER LOADER
@@ -795,6 +825,15 @@ async function cli(): Promise<void> {
     return
   }
 
+  // ── Command plugins: try to dispatch to an installed command plugin
+  if (cmd) {
+    const loaded = await loadCommandPlugin(cmd)
+    if (loaded) {
+      await loaded.handler(argv.slice(1), get)
+      return
+    }
+  }
+
   console.log(`supertinker — minimal agent orchestrator
 
 Commands:
@@ -839,6 +878,8 @@ if (cmd === "resume") {
   }
 }
 
-// Dashboard mode renders its own TUI — skip tmux so it stays in the foreground
-if (!cmd || cmd === "list" || cmd === "status" || cmd === "help" || cmd === "plugins" || isDashboard) cli().catch(err => { console.error(err); process.exit(1) })
+// Only `run` and `resume` need tmux for agent panes. Everything else (including
+// command plugins, status, list, plugins, help) runs directly in the foreground.
+const TMUX_COMMANDS = new Set(["run", "resume"])
+if (!cmd || !TMUX_COMMANDS.has(cmd) || isDashboard || isQuiet) cli().catch(err => { console.error(err); process.exit(1) })
 else if (ensureTmux()) cli().catch(err => { console.error(err); process.exit(1) })
