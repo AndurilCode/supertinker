@@ -1,0 +1,7 @@
+{
+  "name": "context-cache",
+  "type": "hook",
+  "description": "Content-addressable node-output memoization — skips re-execution when cached output exists",
+  "files": ["context-cache.ts"],
+  "version": "1.0.0"
+}
