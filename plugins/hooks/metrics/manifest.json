@@ -1,0 +1,7 @@
+{
+  "name": "metrics",
+  "type": "hook",
+  "description": "Per-agent and per-run token usage, cost, and duration from provider logs",
+  "files": ["metrics.ts"],
+  "version": "1.0.0"
+}

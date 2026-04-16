@@ -104,18 +104,27 @@ export const hook: Hook = {
 
     if (event.event === "PreAgent") {
       const e = event as Extract<HookEvent, { event: "PreAgent" }>
+
+      // Inject worktree path for fork branch nodes
       const forkKey = nodeToFork.get(e.nodeId)
-      if (!forkKey) return { action: "continue" }
+      if (forkKey) {
+        const fork = activeForks.get(forkKey)
+        const branch = fork?.branches.get(e.nodeId)
+        if (branch) {
+          const ctx = event.context as Context
+          ctx[`_worktree:${e.nodeId}`] = branch.path
+        }
+      }
 
-      const fork = activeForks.get(forkKey)
-      if (!fork) return { action: "continue" }
-
-      const branch = fork.branches.get(e.nodeId)
-      if (!branch) return { action: "continue" }
-
-      // PreAgent context is mutable — inject node-specific worktree path
+      // Safety net: if merge errors exist, ensure they're visible in the agent's sliced context.
+      // This catches cases where the architect forgot to include _fork_merge_errors in the slice.
       const ctx = event.context as Context
-      ctx[`_worktree:${e.nodeId}`] = branch.path
+      if (ctx._fork_merge_errors && !nodeToFork.has(e.nodeId)) {
+        const existing = ctx[e.nodeId] ?? ""
+        if (!existing.includes("MERGE CONFLICT")) {
+          ctx[e.nodeId] = `⚠ MERGE CONFLICTS from fork:\n${ctx._fork_merge_errors}\n\n${existing}`
+        }
+      }
 
       return { action: "continue" }
     }
