@@ -1,6 +1,7 @@
 import { spawn } from "child_process"
-import { appendFileSync } from "fs"
+import { appendFileSync, writeFileSync } from "fs"
 import { randomUUID } from "crypto"
+import type { DisplayEvent, TranscriptMapper } from "../display-protocol.js"
 
 interface ProviderContext {
   userPrompt:   string
@@ -43,6 +44,13 @@ export async function invoke(ctx: ProviderContext): Promise<AgentResult> {
 
   const sessionId = randomUUID()
 
+  // Write meta sidecar for dashboard
+  const metaPath = ctx.logFile.replace(/\.log$/, ".meta.json")
+  writeFileSync(metaPath, JSON.stringify({
+    transcriptPath: `${process.env.HOME}/.claude/projects/${sessionId}.jsonl`,
+    provider: "claude",
+  }))
+
   const args = [
     "-p", ctx.userPrompt,
     "--system-prompt", ctx.systemPrompt,
@@ -67,4 +75,73 @@ export async function invoke(ctx: ProviderContext): Promise<AgentResult> {
     : undefined
 
   return result
+}
+
+export const mapTranscript: TranscriptMapper = (line: string) => {
+  let parsed: any
+  try { parsed = JSON.parse(line) } catch { return null }
+
+  const ts = parsed.timestamp ? new Date(parsed.timestamp).getTime() : Date.now()
+
+  // Skip non-display events
+  if (parsed.type === "queue-operation" || parsed.type === "attachment" || parsed.type === "system") return null
+
+  // User events — look for tool_result
+  if (parsed.type === "user" && Array.isArray(parsed.message?.content)) {
+    const events: DisplayEvent[] = []
+    for (const block of parsed.message.content) {
+      if (block.type === "tool_result") {
+        const result = typeof block.content === "string"
+          ? block.content
+          : Array.isArray(block.content)
+            ? block.content.map((b: any) => b.text ?? "").join("").slice(0, 200)
+            : "(result)"
+        events.push({
+          t: "tool_end",
+          ts,
+          id: block.tool_use_id ?? "",
+          name: "",
+          result: result.slice(0, 200),
+        })
+      }
+    }
+    return events.length > 0 ? events : null
+  }
+
+  // Assistant events
+  if (parsed.type === "assistant" && Array.isArray(parsed.message?.content)) {
+    const events: DisplayEvent[] = []
+    for (const block of parsed.message.content) {
+      if (block.type === "thinking" && block.thinking) {
+        events.push({ t: "thinking", ts, text: block.thinking })
+      }
+      if (block.type === "text" && block.text) {
+        events.push({
+          t: "text",
+          ts,
+          text: block.text,
+          final: parsed.message.stop_reason !== null,
+        })
+      }
+      if (block.type === "tool_use") {
+        const args: Record<string, string> = {}
+        if (block.input) {
+          for (const [k, v] of Object.entries(block.input)) {
+            const s = typeof v === "string" ? v : JSON.stringify(v)
+            args[k] = s.length > 100 ? s.slice(0, 100) + "..." : s
+          }
+        }
+        events.push({
+          t: "tool_start",
+          ts,
+          id: block.id ?? "",
+          name: block.name ?? "",
+          args,
+        })
+      }
+    }
+    return events.length > 0 ? events : null
+  }
+
+  return null
 }
