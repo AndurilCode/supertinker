@@ -204,7 +204,7 @@ export async function invoke(ctx: ProviderContext): Promise<AgentResult> {
   const baseArgs: string[] = [
     "-p", ctx.userPrompt,
     "--system-prompt", ctx.systemPrompt,
-    "--dangerously-skip-permissions",
+    "--permission-mode", "auto",
     ...(existingSession ? ["--resume", existingSession] : ["--session-id", sessionId]),
     ...(ctx.model ? ["--model", ctx.model] : []),
   ]
@@ -221,21 +221,34 @@ export async function invoke(ctx: ProviderContext): Promise<AgentResult> {
     if (streamed.sessionId) writeSession(ctx.logFile, streamed.sessionId)
     else if (!existingSession) writeSession(ctx.logFile, sessionId)
   } else {
-    const schema = JSON.stringify({
-      type: "object",
-      required: ["output", "choice"],
-      properties: {
-        output: { type: "string" },
-        choice: { type: "string", enum: ctx.options },
-      },
-    })
-    const args = [...baseArgs, "--output-format", "json", "--json-schema", schema]
+    // An empty options array would make the schema's choice.enum empty, which
+    // the Claude CLI silently treats as "no schema" — the agent then returns
+    // prose in `result` and no `structured_output`. For choice-less callers
+    // (e.g. persistent nodes that strip options) skip the schema entirely and
+    // take the raw result as free-form output.
+    const hasOptions = ctx.options.length > 0
+    const args = [...baseArgs, "--output-format", "json"]
+    if (hasOptions) {
+      const schema = JSON.stringify({
+        type: "object",
+        required: ["output", "choice"],
+        properties: {
+          output: { type: "string" },
+          choice: { type: "string", enum: ctx.options },
+        },
+      })
+      args.push("--json-schema", schema)
+    }
     const raw = await runBlocking("claude", args, ctx.cwd, ctx.logFile, ctx.signal)
     const parsed = JSON.parse(raw.trim())
-    if (parsed.output !== undefined && parsed.choice !== undefined) result = parsed
-    else if (parsed.structured_output?.output !== undefined && parsed.structured_output?.choice !== undefined) result = parsed.structured_output
-    else if (parsed.result) result = JSON.parse(parsed.result)
-    else throw new Error(`Unexpected Claude output shape: ${raw.slice(0, 200)}`)
+    if (hasOptions) {
+      if (parsed.output !== undefined && parsed.choice !== undefined) result = parsed
+      else if (parsed.structured_output?.output !== undefined && parsed.structured_output?.choice !== undefined) result = parsed.structured_output
+      else if (parsed.result) result = JSON.parse(parsed.result)
+      else throw new Error(`Unexpected Claude output shape: ${raw.slice(0, 200)}`)
+    } else {
+      result = { output: parsed.result ?? "", choice: "" }
+    }
     result.metadata = { sessionId: parsed.session_id ?? sessionId, streaming: false }
     // Persist session for future turns
     if (!existingSession) writeSession(ctx.logFile, parsed.session_id ?? sessionId)
