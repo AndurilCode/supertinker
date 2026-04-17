@@ -1,6 +1,6 @@
 ---
 name: supertinker
-description: Run supertinker agent orchestrator workflows and monitor their execution. Use this skill whenever the user wants to run a multi-agent workflow, orchestrate agents, launch supertinker, check on a supertinker run, resume a paused workflow, or mentions supertinker by name. Also trigger when the user asks to search, install, manage, build, or create supertinker plugins, hooks, providers, workflows, or storage adapters.
+description: Run supertinker agent orchestrator workflows and monitor their execution, and the authoritative authoring reference for every supertinker plugin type. Use this skill whenever the user wants to run a multi-agent workflow, orchestrate agents, launch supertinker, check on a supertinker run, resume a paused workflow, or mentions supertinker by name. Also trigger when the user asks to search, install, manage, build, or create supertinker plugins — workflows, providers, hooks, storage adapters, commands, or custom node types.
 ---
 
 **Binary**: `bun ${CLAUDE_SKILL_DIR}/scripts/supertinker.mjs` (aliased below as `ST`). Requires `bun` + `tmux`.
@@ -120,10 +120,52 @@ Manual overrides still work: drop any `.ts` file into `.supertinker/hooks/`, `.s
 
 ## Building Plugins
 
-When the user wants to **create** a new workflow, provider, hook, storage adapter, or CLI command — or asks how any of those work — invoke the `supertinker-doc` skill:
+All plugin types are TypeScript (or JS) files dropped into a search-path directory — no build step, no registration. When the user wants to **create** or **extend** one, open the matching reference file in `${CLAUDE_SKILL_DIR}/references/`:
+
+| Plugin type | Reference | When to use |
+|-------------|-----------|-------------|
+| Workflow | `references/workflows.md` | A reusable graph of agent calls — nodes, guardrails, fork/join, subworkflow |
+| Provider | `references/providers.md` | Wrap a new agent CLI (the only built-in is `claude`) |
+| Hook | `references/hooks.md` | React to lifecycle events; alter flow with `continue`/`skip`/`pause`/`redirect`/`abort` |
+| Storage adapter | `references/storage.md` | Customise where run state is persisted (DB, S3, custom FS) |
+| Command | `references/commands.md` | Add a CLI subcommand surfaced in `$ST --help` |
+| Node type | `references/nodes.md` | Register a new `node.type` primitive (e.g. `script`, `choice`) |
+
+Only read the file for the plugin type you are actually building — they are self-contained.
+
+### Search path (shared by every plugin type)
 
 ```
-Skill({ skill: "supertinker-doc" })
+.supertinker/           ← project-local (highest priority)
+~/.supertinker/         ← user-global
+<supertinker-install>/  ← built-in (lowest priority)
 ```
 
-`supertinker-doc` contains the full authoring reference: schemas, interfaces, examples, search-path rules, the plugin manifest format, and command plugin creation.
+Each type has its own subdirectory: `hooks/`, `providers/`, `workflows/`, `storage/`, `commands/`, `nodes/`. Providers/workflows/storage/commands/nodes resolve first match wins; hooks from all three locations merge and all run.
+
+### Plugin manifest (for `$ST plugins install`)
+
+Every plugin shipped via `$ST plugins install` needs a `manifest.json` alongside its implementation:
+
+```json
+{
+  "name": "my-plugin",
+  "type": "hook",
+  "description": "What it does",
+  "files": ["my-plugin.ts"],
+  "version": "1.0.0"
+}
+```
+
+For manual drop-in plugins (no install command), the manifest is optional.
+
+### Quick reference
+
+| Plugin type | Drop file in | Export | Key constraint |
+|-------------|-------------|--------|----------------|
+| Workflow | `.supertinker/workflows/` | `export const workflow: Workflow` | filename must be `<id>.workflow.ts` |
+| Provider | `.supertinker/providers/` | `export async function invoke(ctx): Promise<AgentResult>` | name must match `command` in registry |
+| Hook | `.supertinker/hooks/` | `export const hook: Hook` | all hooks from all paths are merged and run |
+| Storage | `.supertinker/storage/` | `export const storage: Partial<StorageAdapter>` | only one storage adapter is active; partial overrides filesystem defaults |
+| Command | `.supertinker/commands/` | `export const command: CommandPlugin` | filename is the command name; first match in search path wins |
+| Node type | `.supertinker/nodes/` | `export const node: NodeTypeDefinition` | `type` must not shadow a built-in; first match in search path wins |
