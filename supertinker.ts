@@ -60,7 +60,7 @@ export interface Workflow {
   id: string; description: string; graph: Graph; registry: AgentRegistry; guardrails?: Guardrails
 }
 
-export interface AgentResult { output: string; choice: string; transcriptPath?: string }
+export interface AgentResult { output: string; choice: string; transcriptPath?: string; metadata?: Record<string, unknown> }
 
 export interface PausedState {
   runId: string; nodeId: string; context: Context; agentOutput: string; reason?: string
@@ -80,6 +80,7 @@ export interface StorageAdapter {
   pauseExists(runDir: string): Promise<boolean>
   appendLog(runDir: string, line: string): Promise<void>
   saveFile(runDir: string, name: string, content: string): Promise<void>
+  readFile(runDir: string, name: string): Promise<string | null>
   saveWorkflow(id: string, content: string): Promise<void>
   logPath(runDir: string, nodeId: string): string
   resolveWorkflow(name: string): Promise<string | null>
@@ -145,6 +146,10 @@ export const filesystemStorage: StorageAdapter = {
   },
   async saveFile(runDir, name, content) {
     writeFileSync(join(runDir, name), content)
+  },
+  async readFile(runDir, name) {
+    const path = join(runDir, name)
+    return existsSync(path) ? readFileSync(path, "utf8") : null
   },
   async saveWorkflow(id, content) {
     const dir = join(USER_DIR, "workflows")
@@ -468,7 +473,7 @@ const DIRECTIVE_SUPPORT: Record<string, Set<HookEventName>> = {
 const REWRITE_ALLOWED: Record<string, Set<string>> = {
   PreAgent:    new Set(["userPrompt", "systemPrompt"]),
   PreProvider: new Set(["userPrompt", "systemPrompt", "model", "cwd"]),
-  PostAgent:   new Set(["output", "choice"]),
+  PostAgent:   new Set(["output", "choice", "metadata"]),
 }
 
 function bootstrapLog(runDir: string, label: string, msg: string): void {
@@ -686,6 +691,9 @@ async function runAgentPipeline(
   if (post.action === "rewrite") {
     if (typeof post.patch.output === "string") result.output = post.patch.output
     if (typeof post.patch.choice === "string") result.choice = post.patch.choice
+    if (post.patch.metadata && typeof post.patch.metadata === "object") {
+      result.metadata = { ...(result.metadata ?? {}), ...(post.patch.metadata as Record<string, unknown>) }
+    }
   } else if (await applyDirective(post, state, node, fromNodeId)) return { redirected: true }
   return result
 }
