@@ -608,6 +608,10 @@ const runCmd: CommandPlugin = {
       catalog:     await buildCatalog(storage),
       nodeCatalog: await buildNodeCatalog(),
       cwd:         process.cwd(),
+      // Exact re-invocation command (node/bun binary + entry file) so agents
+      // can call back into supertinker without guessing how it was launched
+      // (npx, bun-from-skill, global symlink, or repo-local tsx).
+      launcher:    `${process.argv[0]} ${process.argv[1]}`,
     }
     if (prompt) initialContext.task = prompt
 
@@ -662,6 +666,24 @@ const resumeCmd: CommandPlugin = {
     const { workflow } = await import(await storage.resolveWorkflow(workflowRef) ?? resolve(workflowRef))
 
     const runDir = storage.runDir(runId)
+
+    // Refresh runtime-computed context keys on every external resume so the
+    // agent sees the current plugin registry (not a snapshot from run start),
+    // and scrub transient retry-feedback keys so a budget-exhausted pause
+    // never leaks the prior turn's "previous attempt" text into a new user
+    // turn. A persistent director, for example, needs `catalog` to reflect
+    // workflows it created mid-run.
+    if (await storage.pauseExists(runDir)) {
+      const paused = await storage.loadPause(runDir)
+      paused.context.catalog     = await buildCatalog(storage)
+      paused.context.nodeCatalog = await buildNodeCatalog()
+      paused.context.cwd         = process.cwd()
+      paused.context.launcher    = `${process.argv[0]} ${process.argv[1]}`
+      for (const k of Object.keys(paused.context)) {
+        if (k.startsWith("_retry_feedback:")) delete paused.context[k]
+      }
+      await storage.savePause(runDir, paused)
+    }
 
     if (quiet) {
       await resume({ workflow, runId, choice, overrides })
