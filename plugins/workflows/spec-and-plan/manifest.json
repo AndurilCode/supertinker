@@ -1,0 +1,7 @@
+{
+  "name": "spec-and-plan",
+  "type": "workflow",
+  "description": "Turn an idea into a reviewed design spec, then a step-by-step implementation plan — inspired by the superpowers brainstorming + writing-plans skills",
+  "files": ["spec-and-plan.workflow.ts"],
+  "version": "1.0.0"
+}
