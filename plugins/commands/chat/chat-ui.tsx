@@ -118,7 +118,7 @@ function classifyRun(runDir: string, runId: string, currentRunId: string): RunSt
   } catch { return null }
 }
 
-function scanActiveRuns(currentRunId: string): RunStatus[] {
+function scanActiveRuns(currentRunId: string, sessionStartMs: number): RunStatus[] {
   let entries: RunStatus[] = []
   try {
     for (const n of readdirSync(RUN_ROOT)) {
@@ -128,15 +128,19 @@ function scanActiveRuns(currentRunId: string): RunStatus[] {
       if (s) entries.push(s)
     }
   } catch { return [] }
-  // Keep only actionable runs: the current chat run plus anything recently
-  // active — running (log touched < 2 min) or recently paused (< 24 h).
-  // Old paused runs are hidden to keep the footer useful; they're still on
-  // disk and can be resumed by explicit --run <id>.
+  // Footer shows what belongs to *this chat session*: the current run plus
+  // anything created or meaningfully updated since chat started — typically
+  // workflows the director itself launched. Older paused runs are hidden
+  // (they're still on disk, reachable via explicit --run <id>). Set
+  // CHAT_STALE_PAUSED_MS to broaden the window (e.g. show the last 24 h).
   const now = Date.now()
+  const pausedCutoff = process.env.CHAT_STALE_PAUSED_MS
+    ? now - STALE_PAUSED_MS
+    : sessionStartMs
   const active = entries.filter(e => {
     if (e.isCurrent) return true
-    if (e.status === "running") return true   // classifier already applied the stale window
-    if (e.status === "paused")  return (now - e.mtimeMs) < STALE_PAUSED_MS
+    if (e.status === "running") return true   // classifier already applied the running-stale window
+    if (e.status === "paused")  return e.mtimeMs >= pausedCutoff
     return false
   })
   active.sort((a, b) => {
@@ -213,18 +217,24 @@ function Chat({ runId, workflow, choice, contextKey, replyKey, initial }: ChatPr
   const runDir = join(RUN_ROOT, runId)
   const { exit } = useApp()
 
+  // Chat session start — used to scope the footer to "what happened during
+  // this session" (current run + child workflows the director launched).
+  // A hair of slack (1 minute earlier) covers the current run's own pause
+  // which may have been written just before chat was opened.
+  const sessionStartMs = Math.floor(Date.now() - 60_000)
+
   const [messages, setMessages] = useState<Msg[]>(
     initial ? [{ role: "agent", text: initial }] : [],
   )
   const [input, setInput]       = useState("")
   const [thinking, setThinking] = useState(false)
-  const [runs, setRuns]         = useState<RunStatus[]>(() => scanActiveRuns(runId))
+  const [runs, setRuns]         = useState<RunStatus[]>(() => scanActiveRuns(runId, sessionStartMs))
 
   // Refresh active runs every 2s
   useEffect(() => {
-    const t = setInterval(() => setRuns(scanActiveRuns(runId)), 2000)
+    const t = setInterval(() => setRuns(scanActiveRuns(runId, sessionStartMs)), 2000)
     return () => clearInterval(t)
-  }, [runId])
+  }, [runId, sessionStartMs])
 
   const submit = async (text: string) => {
     const trimmed = text.trim()
@@ -242,7 +252,7 @@ function Chat({ runId, workflow, choice, contextKey, replyKey, initial }: ChatPr
       return
     }
     if (trimmed === "/run")    { setMessages(m => [...m, { role: "system", text: `runId: ${runId}` }]); return }
-    if (trimmed === "/status") { setRuns(scanActiveRuns(runId)); return }
+    if (trimmed === "/status") { setRuns(scanActiveRuns(runId, sessionStartMs)); return }
     if (trimmed === "/raw")    {
       try { setMessages(m => [...m, { role: "system", text: readFileSync(join(runDir, "context.json"), "utf8") }]) } catch {}
       return
