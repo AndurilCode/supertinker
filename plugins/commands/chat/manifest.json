@@ -1,0 +1,7 @@
+{
+  "name": "chat",
+  "type": "command",
+  "description": "Interactive REPL: type a prompt, see the agent's reply inline",
+  "files": ["chat.ts"],
+  "version": "1.0.0"
+}
