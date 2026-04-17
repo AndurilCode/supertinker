@@ -1,5 +1,5 @@
-import { spawn } from "child_process"
-import { appendFileSync, writeFileSync } from "fs"
+import { spawn, ChildProcess } from "child_process"
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "fs"
 import { randomUUID } from "crypto"
 import type { DisplayEvent, TranscriptMapper } from "../display-protocol.js"
 
@@ -10,73 +10,196 @@ interface ProviderContext {
   cwd:          string
   model?:       string
   logFile:      string
+  onChunk?:     (chunk: string) => void
+  signal?:      AbortSignal
 }
 
 interface AgentResult {
   output: string
   choice: string
   transcriptPath?: string
+  metadata?: Record<string, unknown>
 }
 
-function run(command: string, args: string[], cwd: string, logFile: string): Promise<string> {
+// ─── Session sidecar ────────────────────────────────────────────────────────
+// When the same node invokes the Claude provider more than once (typical for
+// `persistent` nodes driven by an event loop), we want Claude to keep its
+// conversation history instead of starting fresh each turn. We persist the
+// first turn's session_id in a sidecar file next to the node's log, and
+// switch to `--resume <id>` on every subsequent turn.
+
+function sessionPathFor(logFile: string): string {
+  return logFile.replace(/\.log$/, ".session")
+}
+function readExistingSession(logFile: string): string | null {
+  const p = sessionPathFor(logFile)
+  if (!existsSync(p)) return null
+  const id = readFileSync(p, "utf8").trim()
+  return id.length > 0 ? id : null
+}
+function writeSession(logFile: string, sessionId: string): void {
+  writeFileSync(sessionPathFor(logFile), sessionId)
+}
+
+// ─── Blocking (non-streaming) execution ─────────────────────────────────────
+
+function runBlocking(command: string, args: string[], cwd: string, logFile: string, signal?: AbortSignal): Promise<string> {
   return new Promise((res, rej) => {
     const proc = spawn(command, args, { cwd, env: process.env, detached: true, stdio: ["pipe", "pipe", "pipe"] })
     proc.unref()
     let out = "", err = ""
+    const onAbort = () => { try { proc.kill("SIGTERM") } catch {} }
+    signal?.addEventListener("abort", onAbort, { once: true })
     proc.stdout.on("data", (chunk: Buffer) => {
       const txt = chunk.toString(); out += txt
       appendFileSync(logFile, txt)
     })
     proc.stderr.on("data", (chunk: Buffer) => { err += chunk.toString() })
-    proc.on("close", code => code === 0 ? res(out) : rej(new Error(`exit ${code}: ${err.slice(0, 300)}`)))
+    proc.on("close", code => {
+      signal?.removeEventListener("abort", onAbort)
+      if (signal?.aborted) return rej(new Error(`Aborted: ${(signal as any).reason?.message ?? "signal"}`))
+      code === 0 ? res(out) : rej(new Error(`exit ${code}: ${err.slice(0, 300)}`))
+    })
     proc.stdin.end()
   })
 }
 
-export async function invoke(ctx: ProviderContext): Promise<AgentResult> {
-  const schema = JSON.stringify({
-    type: "object",
-    required: ["output", "choice"],
-    properties: {
-      output: { type: "string" },
-      choice: { type: "string", enum: ctx.options },
-    },
+// ─── Streaming (stream-json) execution ──────────────────────────────────────
+// Parses NDJSON events, forwards text_delta to ctx.onChunk, captures the final
+// "result" event. Also captures session_id for the sidecar.
+
+interface StreamedResult {
+  output:   string
+  sessionId?: string
+}
+
+function runStreaming(
+  command: string, args: string[], cwd: string, logFile: string,
+  onChunk: (chunk: string) => void, signal?: AbortSignal,
+): Promise<StreamedResult> {
+  return new Promise((res, rej) => {
+    const proc: ChildProcess = spawn(command, args, { cwd, env: process.env, detached: true, stdio: ["pipe", "pipe", "pipe"] })
+    proc.unref()
+
+    let buf = "", err = ""
+    let accumulated = ""
+    let finalResult: string | undefined
+    let sessionId:   string | undefined
+
+    const onAbort = () => { try { proc.kill("SIGTERM") } catch {} }
+    signal?.addEventListener("abort", onAbort, { once: true })
+
+    const handleLine = (line: string) => {
+      if (!line.trim()) return
+      appendFileSync(logFile, line + "\n")
+      let evt: any
+      try { evt = JSON.parse(line) } catch { return }
+
+      // Top-level session_id (on init and result events)
+      if (typeof evt.session_id === "string") sessionId = evt.session_id
+
+      // Anthropic-style stream_event wrapper with partial message deltas
+      if (evt.type === "stream_event" && evt.event?.type === "content_block_delta") {
+        const delta = evt.event.delta
+        if (delta?.type === "text_delta" && typeof delta.text === "string") {
+          accumulated += delta.text
+          try { onChunk(delta.text) } catch {}
+          return
+        }
+      }
+
+      // Assistant message blocks sometimes carry the final text
+      if (evt.type === "assistant" && Array.isArray(evt.message?.content)) {
+        for (const block of evt.message.content) {
+          if (block.type === "text" && typeof block.text === "string" && !accumulated.endsWith(block.text)) {
+            // Don't double-count if streamed deltas already covered this text.
+            // (The CLI may emit both deltas and the full assistant message.)
+          }
+        }
+      }
+
+      // Terminal result event — authoritative output
+      if (evt.type === "result") {
+        if (typeof evt.result === "string") finalResult = evt.result
+      }
+    }
+
+    proc.stdout!.on("data", (chunk: Buffer) => {
+      buf += chunk.toString()
+      const lines = buf.split(/\r?\n/)
+      buf = lines.pop() ?? ""
+      for (const line of lines) handleLine(line)
+    })
+    proc.stderr!.on("data", (chunk: Buffer) => { err += chunk.toString() })
+    proc.on("close", code => {
+      signal?.removeEventListener("abort", onAbort)
+      if (buf.trim()) handleLine(buf)
+      if (signal?.aborted) return rej(new Error(`Aborted: ${(signal as any).reason?.message ?? "signal"}`))
+      if (code !== 0) return rej(new Error(`exit ${code}: ${err.slice(0, 400)}`))
+      res({ output: finalResult ?? accumulated, sessionId })
+    })
+    proc.stdin?.end()
   })
+}
 
-  const sessionId = randomUUID()
+// ─── Public entrypoint ──────────────────────────────────────────────────────
 
-  // Write meta sidecar for dashboard
-  // Find the transcript by searching for the sessionId.jsonl file across Claude project dirs
+export async function invoke(ctx: ProviderContext): Promise<AgentResult> {
+  const existingSession = readExistingSession(ctx.logFile)
+  const sessionId       = existingSession ?? randomUUID()
+  const streaming       = typeof ctx.onChunk === "function"
+
+  // Dashboard meta sidecar
   const claudeProjects = `${process.env.HOME}/.claude/projects`
-  const metaPath = ctx.logFile.replace(/\.log$/, ".meta.json")
-  const transcriptFile = `${sessionId}.jsonl`
+  const metaPath       = ctx.logFile.replace(/\.log$/, ".meta.json")
+  writeFileSync(metaPath, JSON.stringify({
+    transcriptFile: `${sessionId}.jsonl`, sessionId, claudeProjects, provider: "claude",
+  }))
 
-  // Write initial meta with a glob pattern — dashboard will resolve it
-  writeFileSync(metaPath, JSON.stringify({ transcriptFile, sessionId, claudeProjects, provider: "claude" }))
-
-  const args = [
+  // Argument assembly. Streaming mode drops --json-schema because stream-json
+  // and schema validation don't compose; free-form output is fine for any
+  // caller that opts into streaming (typically `persistent` nodes).
+  const baseArgs: string[] = [
     "-p", ctx.userPrompt,
     "--system-prompt", ctx.systemPrompt,
-    "--output-format", "json",
-    "--json-schema", schema,
     "--dangerously-skip-permissions",
-    "--session-id", sessionId,
+    ...(existingSession ? ["--resume", existingSession] : ["--session-id", sessionId]),
     ...(ctx.model ? ["--model", ctx.model] : []),
   ]
 
-  const raw = await run("claude", args, ctx.cwd, ctx.logFile)
-
-  const parsed = JSON.parse(raw.trim())
   let result: AgentResult
-  if (parsed.output !== undefined && parsed.choice !== undefined) result = parsed
-  else if (parsed.structured_output?.output !== undefined && parsed.structured_output?.choice !== undefined) result = parsed.structured_output
-  else if (parsed.result) result = JSON.parse(parsed.result)
-  else throw new Error(`Unexpected Claude output shape: ${raw.slice(0, 200)}`)
+  if (streaming) {
+    const args = [...baseArgs, "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
+    const streamed = await runStreaming("claude", args, ctx.cwd, ctx.logFile, ctx.onChunk!, ctx.signal)
+    result = {
+      output:   streamed.output,
+      choice:   ctx.options[0] ?? "",
+      metadata: { sessionId: streamed.sessionId ?? sessionId, streaming: true },
+    }
+    if (streamed.sessionId) writeSession(ctx.logFile, streamed.sessionId)
+    else if (!existingSession) writeSession(ctx.logFile, sessionId)
+  } else {
+    const schema = JSON.stringify({
+      type: "object",
+      required: ["output", "choice"],
+      properties: {
+        output: { type: "string" },
+        choice: { type: "string", enum: ctx.options },
+      },
+    })
+    const args = [...baseArgs, "--output-format", "json", "--json-schema", schema]
+    const raw = await runBlocking("claude", args, ctx.cwd, ctx.logFile, ctx.signal)
+    const parsed = JSON.parse(raw.trim())
+    if (parsed.output !== undefined && parsed.choice !== undefined) result = parsed
+    else if (parsed.structured_output?.output !== undefined && parsed.structured_output?.choice !== undefined) result = parsed.structured_output
+    else if (parsed.result) result = JSON.parse(parsed.result)
+    else throw new Error(`Unexpected Claude output shape: ${raw.slice(0, 200)}`)
+    result.metadata = { sessionId: parsed.session_id ?? sessionId, streaming: false }
+    // Persist session for future turns
+    if (!existingSession) writeSession(ctx.logFile, parsed.session_id ?? sessionId)
+  }
 
-  result.transcriptPath = parsed.session_id
-    ? `${sessionId}.jsonl`
-    : undefined
-
+  result.transcriptPath = `${sessionId}.jsonl`
   return result
 }
 
@@ -86,10 +209,8 @@ export const mapTranscript: TranscriptMapper = (line: string) => {
 
   const ts = parsed.timestamp ? new Date(parsed.timestamp).getTime() : Date.now()
 
-  // Skip non-display events
   if (parsed.type === "queue-operation" || parsed.type === "attachment" || parsed.type === "system") return null
 
-  // User events — look for tool_result
   if (parsed.type === "user" && Array.isArray(parsed.message?.content)) {
     const events: DisplayEvent[] = []
     for (const block of parsed.message.content) {
@@ -111,7 +232,6 @@ export const mapTranscript: TranscriptMapper = (line: string) => {
     return events.length > 0 ? events : null
   }
 
-  // Assistant events
   if (parsed.type === "assistant" && Array.isArray(parsed.message?.content)) {
     const events: DisplayEvent[] = []
     for (const block of parsed.message.content) {

@@ -1,0 +1,7 @@
+{
+  "name": "director",
+  "type": "workflow",
+  "description": "Persistent Claude agent that can create and launch supertinker workflows on request",
+  "files": ["director.workflow.ts"],
+  "version": "1.0.0"
+}
