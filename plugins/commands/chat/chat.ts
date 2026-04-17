@@ -25,6 +25,106 @@ import { join }                                         from "path"
 import { spawn }                                        from "child_process"
 import type { CommandPlugin }                           from "../../../cli.js"
 
+// ─── ANSI helpers ──────────────────────────────────────────────────────────
+const C = {
+  reset: "\x1b[0m", bold: "\x1b[1m", dim: "\x1b[2m", italic: "\x1b[3m", underline: "\x1b[4m",
+  red: "\x1b[31m", green: "\x1b[32m", yellow: "\x1b[33m", blue: "\x1b[34m",
+  magenta: "\x1b[35m", cyan: "\x1b[36m", gray: "\x1b[90m",
+  bgGray: "\x1b[100m",
+}
+
+// ─── Spinner ───────────────────────────────────────────────────────────────
+// Braille-based; works in any modern terminal. Overwrites the line via \r.
+function startSpinner(label: string): () => void {
+  const frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+  let i = 0
+  const render = () => process.stdout.write(`\r${C.cyan}${frames[i++ % frames.length]}${C.reset} ${C.dim}${label}${C.reset}`)
+  render()
+  const t = setInterval(render, 80)
+  return () => {
+    clearInterval(t)
+    // Erase the spinner line completely.
+    process.stdout.write(`\r\x1b[2K`)
+  }
+}
+
+// ─── Minimal markdown → ANSI renderer ──────────────────────────────────────
+// Covers the constructs models actually reach for: headings, bold, italic,
+// inline code, fenced code blocks, bullet lists, numbered lists, blockquotes,
+// links, horizontal rules. Everything else is passed through unchanged.
+function renderMarkdown(md: string): string {
+  const lines = md.split("\n")
+  const out: string[] = []
+  let inFence = false
+  let fenceLang = ""
+  let codeBuf: string[] = []
+
+  const flushFence = () => {
+    if (codeBuf.length === 0) return
+    const top = fenceLang ? `${C.gray}┌─ ${fenceLang} ${"─".repeat(Math.max(1, 40 - fenceLang.length))}${C.reset}` : `${C.gray}┌${"─".repeat(42)}${C.reset}`
+    const bot = `${C.gray}└${"─".repeat(43)}${C.reset}`
+    out.push(top)
+    for (const l of codeBuf) out.push(`${C.gray}│${C.reset} ${C.green}${l}${C.reset}`)
+    out.push(bot)
+    codeBuf = []
+    fenceLang = ""
+  }
+
+  const inline = (s: string): string => {
+    // Inline code (run first so emphasis inside code isn't processed)
+    s = s.replace(/`([^`]+)`/g, (_, code) => `${C.bgGray}${C.cyan} ${code} ${C.reset}`)
+    // Bold **text** or __text__
+    s = s.replace(/\*\*([^*]+)\*\*/g, `${C.bold}$1${C.reset}`)
+    s = s.replace(/__([^_]+)__/g, `${C.bold}$1${C.reset}`)
+    // Italic *text* or _text_ (after bold so we don't re-match)
+    s = s.replace(/(^|[\s(])\*([^*\n]+)\*/g, `$1${C.italic}$2${C.reset}`)
+    s = s.replace(/(^|[\s(])_([^_\n]+)_/g, `$1${C.italic}$2${C.reset}`)
+    // Links [text](url) — show as underlined text + dim url
+    s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, `${C.underline}${C.blue}$1${C.reset} ${C.dim}($2)${C.reset}`)
+    return s
+  }
+
+  for (const raw of lines) {
+    // Fenced code blocks
+    const fence = raw.match(/^```(\w*)\s*$/)
+    if (fence) {
+      if (inFence) { flushFence(); inFence = false }
+      else         { inFence = true; fenceLang = fence[1] ?? "" }
+      continue
+    }
+    if (inFence) { codeBuf.push(raw); continue }
+
+    // Horizontal rule
+    if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(raw)) { out.push(`${C.gray}${"─".repeat(44)}${C.reset}`); continue }
+
+    // Headings
+    const h = raw.match(/^(#{1,6})\s+(.*)$/)
+    if (h) {
+      const level = h[1].length
+      const text = inline(h[2])
+      if (level === 1) out.push(`\n${C.bold}${C.underline}${text}${C.reset}\n`)
+      else if (level === 2) out.push(`\n${C.bold}${C.yellow}${text}${C.reset}`)
+      else out.push(`${C.bold}${text}${C.reset}`)
+      continue
+    }
+
+    // Blockquote
+    if (/^\s*>\s+/.test(raw)) { out.push(`${C.gray}│${C.reset} ${C.dim}${inline(raw.replace(/^\s*>\s+/, ""))}${C.reset}`); continue }
+
+    // Bullet list
+    const b = raw.match(/^(\s*)[-*+]\s+(.*)$/)
+    if (b) { out.push(`${b[1]}${C.cyan}•${C.reset} ${inline(b[2])}`); continue }
+
+    // Numbered list
+    const n = raw.match(/^(\s*)(\d+\.)\s+(.*)$/)
+    if (n) { out.push(`${n[1]}${C.cyan}${n[2]}${C.reset} ${inline(n[3])}`); continue }
+
+    out.push(inline(raw))
+  }
+  if (inFence) flushFence()
+  return out.join("\n")
+}
+
 const RUN_ROOT = "/tmp/orchestrator"
 
 function supertinkerBin(): { cmd: string; args: string[] } {
@@ -122,12 +222,12 @@ export const command: CommandPlugin = {
 
     // Initial greeting
     const initial = readState(runDir)?.context?.[replyKey]
-    process.stdout.write(`\nchat: connected to ${runId}  (type /exit to quit, /run for id, /raw for context)\n`)
-    if (initial) process.stdout.write(`\n${initial}\n`)
+    process.stdout.write(`\n${C.dim}chat: connected to ${C.reset}${C.cyan}${runId}${C.reset}${C.dim}  (type /exit to quit, /run for id, /raw for context)${C.reset}\n`)
+    if (initial) process.stdout.write(`\n${renderMarkdown(initial)}\n`)
 
     // ── REPL ──────────────────────────────────────────────────────────
     const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true })
-    rl.setPrompt("\n> ")
+    rl.setPrompt(`\n${C.cyan}❯${C.reset} `)
     rl.prompt()
 
     let thinking = false
@@ -136,10 +236,10 @@ export const command: CommandPlugin = {
       try {
         const st = readState(runDir)
         const reply = st?.context?.[replyKey]
-        if (reply) process.stdout.write(`\n${reply}\n`)
-        else process.stdout.write(`\n(no reply captured under context.${replyKey})\n`)
+        if (reply) process.stdout.write(`\n${renderMarkdown(reply)}\n`)
+        else process.stdout.write(`\n${C.dim}(no reply captured under context.${replyKey})${C.reset}\n`)
       } catch (err) {
-        process.stdout.write(`\n(failed to read state: ${err})\n`)
+        process.stdout.write(`\n${C.red}(failed to read state: ${err})${C.reset}\n`)
       }
     }
 
@@ -150,41 +250,51 @@ export const command: CommandPlugin = {
 
       // Slash commands
       if (line === "/exit" || line === "/quit") {
-        process.stdout.write(`\nchat: run is paused at ${runId}. resume later with:\n  supertinker chat --workflow ${workflow} --run ${runId}\n`)
+        process.stdout.write(`\n${C.dim}paused at ${C.reset}${C.cyan}${runId}${C.reset}${C.dim}. reconnect with:${C.reset}\n  supertinker chat --workflow ${workflow} --run ${runId}\n`)
         rl.close()
         return
       }
-      if (line === "/run") { process.stdout.write(`runId: ${runId}\n`); rl.prompt(); return }
-      if (line === "/raw") {
-        try { process.stdout.write(readFileSync(join(runDir, "context.json"), "utf8") + "\n") } catch {}
+      if (line === "/run")   { process.stdout.write(`${C.dim}runId:${C.reset} ${C.cyan}${runId}${C.reset}\n`); rl.prompt(); return }
+      if (line === "/raw")   {
+        try { process.stdout.write(`${C.dim}${readFileSync(join(runDir, "context.json"), "utf8")}${C.reset}\n`) } catch {}
         rl.prompt(); return
       }
-      if (line === "/tail") {
+      if (line === "/tail")  {
         try {
           const lines = readFileSync(join(runDir, "orchestrator.log"), "utf8").trim().split("\n")
-          process.stdout.write(lines.slice(-20).join("\n") + "\n")
+          process.stdout.write(`${C.dim}${lines.slice(-20).join("\n")}${C.reset}\n`)
         } catch {}
+        rl.prompt(); return
+      }
+      if (line === "/help")  {
+        process.stdout.write(
+          `${C.dim}commands: ${C.reset}${C.cyan}/exit${C.reset} ${C.dim}leave · ${C.reset}` +
+          `${C.cyan}/run${C.reset} ${C.dim}print runId · ${C.reset}` +
+          `${C.cyan}/raw${C.reset} ${C.dim}dump context · ${C.reset}` +
+          `${C.cyan}/tail${C.reset} ${C.dim}last 20 log lines${C.reset}\n`,
+        )
         rl.prompt(); return
       }
 
       // Inject + resume
       thinking = true
+      const stopSpinner = startSpinner("thinking")
       try {
         const state = readState(runDir)
         state.context[contextKey] = line
         writeState(runDir, state)
 
-        process.stdout.write("…thinking")
-        const pulse = setInterval(() => process.stdout.write("."), 1000)
         const code = await runChild(["resume", "--run", runId!, "--choice", choice, "--workflow", workflow, "--quiet"])
-        clearInterval(pulse)
-        process.stdout.write("\r           \r")
+        stopSpinner()
 
         if (code !== 0) {
-          process.stdout.write(`(resume exited ${code})\n`)
+          process.stdout.write(`${C.red}(resume exited ${code})${C.reset}\n`)
         } else {
           printReply()
         }
+      } catch (err) {
+        stopSpinner()
+        process.stdout.write(`${C.red}(error: ${err})${C.reset}\n`)
       } finally {
         thinking = false
         rl.prompt()

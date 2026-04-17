@@ -29,13 +29,16 @@ export const node: NodeTypeDefinition = {
     "Pair with options: { <choice>: <self-id> } to loop, or with an off-ramp option to terminate.",
   schema: {
     requires: ["agent", "instruction", "options"],
-    optional: ["slice", "timeout", "cwd", "systemPrompt", "fallback"],
+    optional: ["slice", "timeout", "cwd", "systemPrompt", "fallback", "trigger"],
     example: {
       id:          "support",
       type:        "persistent",
       agent:       "helper",
       instruction: "Answer the user's latest message using prior turns in context",
       options:     { event: "support" },
+      // optional: name of the context key that must be non-empty before the
+      // agent runs. Defaults to "event" — matches the subscribe / chat pattern.
+      trigger:     "event",
     } as any,
   },
   validate: (n) => {
@@ -46,6 +49,22 @@ export const node: NodeTypeDefinition = {
     return null
   },
   execute: async (ctx) => {
+    // Skip the agent call on turns where no trigger value is present. This
+    // avoids the noisy first-boot case where the workflow starts before any
+    // user event has arrived — the agent would otherwise see empty context
+    // and reply with something confused. The node still pauses here, which
+    // is what the chat / subscribe drivers expect.
+    const triggerKey = ((ctx.node as any).trigger as string | undefined) ?? "event"
+    const triggerVal = (ctx.context[triggerKey] ?? "").trim()
+    if (!triggerVal) {
+      const choices = Object.keys(ctx.node.options!).join(" | ")
+      await ctx.writePause(
+        `persistent: awaiting first "${triggerKey}" — resume with \`--choice <${choices}>\` ` +
+        `after setting context.${triggerKey}`,
+      )
+      return
+    }
+
     // Strip options for the agent call so no choice sentinel is required —
     // persistent agents produce free-form output. The options map stays on
     // the node for the resume path to use.
