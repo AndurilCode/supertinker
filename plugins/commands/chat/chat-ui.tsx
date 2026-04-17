@@ -141,7 +141,7 @@ function classifyRun(runDir: string, runId: string, currentRunId: string): RunSt
   } catch { return null }
 }
 
-function scanActiveRuns(currentRunId: string, sessionStartMs: number): RunStatus[] {
+function scanActiveRuns(currentRunId: string, sessionStartMs: number, ownWorkflow: string): RunStatus[] {
   let entries: RunStatus[] = []
   try {
     for (const n of readdirSync(RUN_ROOT)) {
@@ -160,11 +160,13 @@ function scanActiveRuns(currentRunId: string, sessionStartMs: number): RunStatus
   const pausedCutoff = process.env.CHAT_STALE_PAUSED_MS
     ? now - STALE_PAUSED_MS
     : sessionStartMs
-  // The chat's own run is excluded — the footer is a window into work the
-  // chat spawned (or pre-existing runs active in this session), not a
-  // redundant display of the run you're currently talking to.
+  // Filter out every run belonging to the chat's own workflow — the chat is
+  // already talking to one of those, and the rest are just other instances
+  // of the same agent (often stale boot remnants from prior sessions). The
+  // footer is for work the chat has dispatched to *other* workflows.
+  const ownPrefix = `${ownWorkflow}-`
   const active = entries.filter(e => {
-    if (e.isCurrent) return false
+    if (e.runId.startsWith(ownPrefix)) return false
     if (e.status === "running") return true   // classifier already applied the running-stale window
     if (e.status === "paused")  return e.mtimeMs >= pausedCutoff
     return false
@@ -282,7 +284,7 @@ function Chat({ runId, workflow, choice, contextKey, replyKey, initial }: ChatPr
   const [input, setInput]       = useState("")
   const [thinking, setThinking] = useState(false)
   const [elapsed, setElapsed]   = useState(0)
-  const [runs, setRuns]         = useState<RunStatus[]>(() => scanActiveRuns(runId, sessionStartMs))
+  const [runs, setRuns]         = useState<RunStatus[]>(() => scanActiveRuns(runId, sessionStartMs, workflow))
 
   // Tick a 1s counter while thinking so the spinner line reads "(Ns · thinking)".
   // Reset to zero when we enter thinking and stop ticking when we leave.
@@ -297,9 +299,9 @@ function Chat({ runId, workflow, choice, contextKey, replyKey, initial }: ChatPr
   // Refresh active runs every 1s so status flips (paused → running → paused)
   // during a resume are visible while the user waits for a reply.
   useEffect(() => {
-    const t = setInterval(() => setRuns(scanActiveRuns(runId, sessionStartMs)), 1000)
+    const t = setInterval(() => setRuns(scanActiveRuns(runId, sessionStartMs, workflow)), 1000)
     return () => clearInterval(t)
-  }, [runId, sessionStartMs])
+  }, [runId, sessionStartMs, workflow])
 
   // ── Auto-announce completed child runs to the director ──────────────────
   // When a workflow the director launched finishes, we want the director to
@@ -364,7 +366,7 @@ function Chat({ runId, workflow, choice, contextKey, replyKey, initial }: ChatPr
       return
     }
     if (trimmed === "/run")    { setMessages(m => [...m, { role: "system", text: `runId: ${runId}` }]); return }
-    if (trimmed === "/status") { setRuns(scanActiveRuns(runId, sessionStartMs)); return }
+    if (trimmed === "/status") { setRuns(scanActiveRuns(runId, sessionStartMs, workflow)); return }
     if (trimmed === "/raw")    {
       try { setMessages(m => [...m, { role: "system", text: readFileSync(join(runDir, "context.json"), "utf8") }]) } catch {}
       return
