@@ -1,9 +1,6 @@
 import { spawnSync } from "child_process"
 import type { NodeTypeDefinition } from "../../../supertinker"
 
-// Expose every context key as $CTX_<UPPER_KEY> so scripts can read upstream
-// outputs without unsafe in-place [key] interpolation. Names are normalised
-// to A-Z 0-9 _ so JSON-y keys still produce a valid env var.
 function buildEnv(ctx: Record<string, string>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env }
   for (const [k, v] of Object.entries(ctx)) {
@@ -13,26 +10,26 @@ function buildEnv(ctx: Record<string, string>): NodeJS.ProcessEnv {
 }
 
 export const node: NodeTypeDefinition = {
-  type: "script",
-  description: "Runs a shell command. Context is exposed as $CTX_<KEY> env vars; node.stdin names a context key whose value is piped to stdin. Stdout (trimmed) becomes the node's output.",
+  type: "choice",
+  description: "Runs a shell command; the first line of stdout must equal one of the options keys, and that option's target is taken. Same context wiring as script ($CTX_<KEY> env + node.stdin pipe).",
   schema: {
     requires: ["instruction", "options"],
     optional: ["stdin", "cwd", "slice", "timeout"],
     example: {
-      id:          "transform",
-      type:        "script",
-      instruction: "jq '.summary'",
+      id:          "decide",
+      type:        "choice",
+      instruction: "[ -n \"$CTX_PLAN\" ] && echo continue || echo retry",
       stdin:       "plan",
-      options:     { done: "next" },
+      options:     { continue: "next", retry: "plan-again" },
     } as any,
   },
   validate: (n) => {
-    if (!n.options?.done) return `script "${n.id}" requires options.done`
-    if (!n.instruction)   return `script "${n.id}" requires instruction (the shell command to run)`
+    if (!n.instruction) return `choice "${n.id}" requires instruction`
+    if (!n.options || Object.keys(n.options).length === 0)
+      return `choice "${n.id}" requires non-empty options`
     return null
   },
   execute: async (ctx) => {
-    // [key] substitution still supported for trivial/safe inline values.
     const cmd = (ctx.node.instruction ?? "").replace(/\[([^\]\s]+)\]/g, (m, k) => ctx.context[k] ?? m)
 
     const stdinKey = (ctx.node as any).stdin as string | undefined
@@ -49,10 +46,19 @@ export const node: NodeTypeDefinition = {
     })
     if (result.status !== 0) {
       const stderr = (result.stderr ?? "").slice(0, 500)
-      return ctx.errorFallback(`script exited ${result.status}: ${stderr}`)
+      return ctx.errorFallback(`choice exited ${result.status}: ${stderr}`)
     }
-    ctx.context[ctx.node.id] = (result.stdout ?? "").trimEnd()
+
+    const stdout = (result.stdout ?? "").trim()
+    const label  = stdout.split(/\r?\n/)[0]?.trim() ?? ""
+    const next   = ctx.node.options![label]
+    if (!next) {
+      const valid = Object.keys(ctx.node.options!).join(", ")
+      return ctx.errorFallback(`choice "${ctx.node.id}" got label "${label}" — not in options: ${valid}`)
+    }
+
+    ctx.context[ctx.node.id] = stdout
     await ctx.saveContext()
-    await ctx.executeNode(ctx.node.options!.done, ctx.node.id)
+    await ctx.executeNode(next, ctx.node.id)
   },
 }

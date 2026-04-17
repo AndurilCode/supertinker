@@ -1,0 +1,7 @@
+{
+  "name": "choice",
+  "type": "node",
+  "description": "Runs a shell command; first line of stdout selects the next branch from options",
+  "files": ["choice.ts"],
+  "version": "1.0.0"
+}

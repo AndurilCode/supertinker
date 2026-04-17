@@ -646,24 +646,40 @@ interface NodeExecuteCtx {
 }
 ```
 
-### Minimal Example: `script`
+### Built-in Examples: `script` and `choice`
+
+The bundled `plugins/nodes/script` and `plugins/nodes/choice` plugins together cover most "deterministic middleware between agents" needs — JSON transformations, format conversions, validators, branching on shell exit logic, etc. Both:
+
+- Expose every context key as `$CTX_<UPPER_KEY>` env var (non-`A-Z 0-9` characters become `_`), so you can read upstream output safely without inlining it into the command string.
+- Accept an optional `stdin` field naming a context key whose value is piped to the command's stdin — the right way to pass JSON or any value with quotes/newlines.
+- Still support `[key]` interpolation in the `instruction` for trivial inline values, but env/stdin is preferred.
 
 ```typescript
+// plugins/nodes/script/script.ts (abridged)
 import { spawnSync } from "child_process"
 import type { NodeTypeDefinition } from "supertinker"
 
+function buildEnv(ctx: Record<string, string>): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env }
+  for (const [k, v] of Object.entries(ctx)) {
+    env[`CTX_${k.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`] = v
+  }
+  return env
+}
+
 export const node: NodeTypeDefinition = {
   type: "script",
-  description: "Runs a shell command in node.cwd, stores stdout as this node's output, follows options.done",
+  description: "Runs a shell command. $CTX_<KEY> env + node.stdin pipe; stdout becomes the node's output.",
   schema: {
     requires: ["instruction", "options"],
-    optional: ["cwd", "slice", "timeout"],
+    optional: ["stdin", "cwd", "slice", "timeout"],
     example: {
-      id:          "count-files",
+      id:          "transform",
       type:        "script",
-      instruction: "ls -1 | wc -l",
+      instruction: "jq '.summary'",
+      stdin:       "plan",
       options:     { done: "next" },
-    },
+    } as any,
   },
   validate: (n) => {
     if (!n.options?.done) return `script "${n.id}" requires options.done`
@@ -671,14 +687,14 @@ export const node: NodeTypeDefinition = {
     return null
   },
   execute: async (ctx) => {
-    // Substitute [key] tokens with context values (no agent-style context dump).
     const cmd = (ctx.node.instruction ?? "").replace(/\[([^\]\s]+)\]/g, (m, k) => ctx.context[k] ?? m)
+    const stdinKey = (ctx.node as any).stdin as string | undefined
+    const input    = stdinKey ? (ctx.context[stdinKey] ?? "") : undefined
+
     const result = spawnSync(cmd, {
-      cwd:       ctx.node.cwd ?? process.cwd(),
-      shell:     true,
-      encoding:  "utf8",
-      timeout:   ctx.node.timeout ?? 60_000,
-      maxBuffer: 10 * 1024 * 1024,
+      cwd: ctx.node.cwd ?? process.cwd(), shell: true, encoding: "utf8",
+      input, env: buildEnv(ctx.context),
+      timeout: ctx.node.timeout ?? 60_000, maxBuffer: 10 * 1024 * 1024,
     })
     if (result.status !== 0) return ctx.errorFallback(
       `script exited ${result.status}: ${(result.stderr ?? "").slice(0, 500)}`
@@ -690,17 +706,60 @@ export const node: NodeTypeDefinition = {
 }
 ```
 
-> ⚠️ **Shell-injection caveat:** `script` runs `instruction` through `shell: true`. Workflows are authored/approved input, so this is intentional — but do not expose `script` to untrusted user prompts without sanitisation.
+`choice` shares the exact same context wiring but uses `options` for **deterministic branching**: the **first line of stdout** must equal one of the options keys, and that option's target is taken. If stdout doesn't match any key, the run routes through `errorFallback` to the fallback node.
+
+```typescript
+// plugins/nodes/choice/choice.ts (abridged)
+export const node: NodeTypeDefinition = {
+  type: "choice",
+  description: "Runs a shell command; first line of stdout selects the next branch from options.",
+  schema: {
+    requires: ["instruction", "options"],
+    optional: ["stdin", "cwd", "slice", "timeout"],
+    example: {
+      id:          "decide",
+      type:        "choice",
+      instruction: "[ -n \"$CTX_PLAN\" ] && echo continue || echo retry",
+      stdin:       "plan",
+      options:     { continue: "next", retry: "plan-again" },
+    } as any,
+  },
+  // execute: same env/stdin wiring as script, then:
+  //   const label = stdout.split(/\r?\n/)[0]?.trim() ?? ""
+  //   const next  = ctx.node.options![label]
+  //   if (!next) return ctx.errorFallback(`label "${label}" not in options`)
+  //   ctx.context[ctx.node.id] = stdout
+  //   await ctx.saveContext()
+  //   await ctx.executeNode(next, ctx.node.id)
+}
+```
+
+#### Pipeline pattern
+
+Use `script` for transformation, `choice` for routing. Together they cover most deterministic glue between agent steps:
+
+```
+agent (produces JSON)
+  → script  (jq '.summary'   stdin: "agent-id")     → context["transform"]
+  → choice  ([ -n "$CTX_TRANSFORM" ] && echo yes || echo no)
+       yes → next agent
+       no  → retry / paused
+```
+
+> ⚠️ **Shell-injection caveat:** both `script` and `choice` run `instruction` through `shell: true` and pass values via env, not interpolation. Authored workflows are trusted input by design — but if you ever wire `instruction` from a free-form user prompt, sanitise it first.
 
 ### Architect Discoverability
 
 The meta architect sees your plugin through the `[nodeCatalog]` context key (built by `buildNodeCatalog()`):
 
 ```
-Custom node types (1):
-- script: Runs a shell command in node.cwd, stores stdout as this node's output, follows options.done
+Custom node types (2):
+- choice: Runs a shell command; the first line of stdout must equal one of the options keys, ...
   requires: instruction, options
-  example: {"id":"count-files","type":"script","instruction":"ls -1 | wc -l","options":{"done":"next"}}
+  example: {"id":"decide","type":"choice","instruction":"...","stdin":"plan","options":{"continue":"next","retry":"plan-again"}}
+- script: Runs a shell command. $CTX_<KEY> env + node.stdin pipe; stdout becomes the node's output.
+  requires: instruction, options
+  example: {"id":"transform","type":"script","instruction":"jq '.summary'","stdin":"plan","options":{"done":"next"}}
 ```
 
 Keep `description`, `schema.requires`, and `schema.example` accurate and minimal — that's the architect's only view of your type.
