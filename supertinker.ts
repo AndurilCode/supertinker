@@ -257,6 +257,11 @@ export type HookDirective =
   | { action: "pause";    reason: string }
   | { action: "redirect"; targetNodeId: string }
   | { action: "abort";    reason: string }
+  // Transform-middleware: mutate the event payload for the downstream step.
+  // Only fields listed in REWRITE_ALLOWED[event] are honored; other keys are
+  // warned and ignored. Multiple rewrites compose; flow-control directives
+  // from the same batch trump rewrites (rewrite is discarded in that case).
+  | { action: "rewrite"; patch: Record<string, unknown>; reason?: string }
 
 export interface Hook {
   name:         string
@@ -441,6 +446,8 @@ const VALID_EVENTS = new Set<HookEventName>(BUILTIN_HOOK_EVENTS)
 
 const DIRECTIVE_RANK: Record<string, number> = {
   abort: 5, pause: 4, redirect: 3, skip: 2, continue: 1,
+  // rewrite is non-terminal — it's tracked separately, not in the winner race.
+  rewrite: 0,
 }
 
 // Directive support is enforced for built-in events only. Custom event names
@@ -452,6 +459,16 @@ const DIRECTIVE_SUPPORT: Record<string, Set<HookEventName>> = {
   redirect: new Set(["PreAgent", "PreProvider", "PostAgent"]),
   skip:     new Set(["PreAgent", "PreProvider"]),
   continue: new Set(VALID_EVENTS),
+  rewrite:  new Set(["PreAgent", "PreProvider", "PostAgent"]),
+}
+
+// Whitelist of patch keys a hook may rewrite, per event. Keys outside the
+// whitelist are dropped with a warning — this prevents a hook from silently
+// changing fields the orchestrator doesn't re-read downstream.
+const REWRITE_ALLOWED: Record<string, Set<string>> = {
+  PreAgent:    new Set(["userPrompt", "systemPrompt"]),
+  PreProvider: new Set(["userPrompt", "systemPrompt", "model", "cwd"]),
+  PostAgent:   new Set(["output", "choice"]),
 }
 
 function bootstrapLog(runDir: string, label: string, msg: string): void {
@@ -522,9 +539,24 @@ async function emitHook(
   } as HookEvent
 
   const isBuiltinEvent = VALID_EVENTS.has(event)
+  const allowedKeys = REWRITE_ALLOWED[event]
   const directives: Array<{ directive: HookDirective; priority: number }> = []
+  const cumulativePatch: Record<string, unknown> = {}
 
-  const runOne = async (hook: Hook): Promise<void> => {
+  const filterPatch = (hookName: string, patch: Record<string, unknown>): Record<string, unknown> => {
+    if (!allowedKeys) {
+      process.stderr.write(`HOOK-WARN ${hookName}: "rewrite" not supported for ${event}, treating as continue\n`)
+      return {}
+    }
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(patch)) {
+      if (allowedKeys.has(k)) out[k] = v
+      else process.stderr.write(`HOOK-WARN ${hookName}: rewrite key "${k}" not allowed for ${event}, dropped\n`)
+    }
+    return out
+  }
+
+  const runOne = async (hook: Hook, sequential: boolean): Promise<void> => {
     try {
       const result = await Promise.race([
         hook.handler(eventObj),
@@ -532,7 +564,21 @@ async function emitHook(
       ])
 
       let directive: HookDirective = result
-      if (result.action !== "continue") {
+      if (result.action === "rewrite") {
+        const supported = DIRECTIVE_SUPPORT.rewrite
+        if (isBuiltinEvent && !supported?.has(event)) {
+          process.stderr.write(`HOOK-WARN ${hook.name}: "rewrite" not supported for ${event}, treating as continue\n`)
+          directive = { action: "continue" }
+        } else {
+          const filtered = filterPatch(hook.name, result.patch ?? {})
+          Object.assign(cumulativePatch, filtered)
+          // Sequential hooks see each other's rewrites — mutate the shared
+          // eventObj so the next hook's handler reads the updated payload.
+          if (sequential) Object.assign(eventObj, filtered)
+          // Rewrites don't compete for flow control — record as continue.
+          directive = { action: "continue" }
+        }
+      } else if (result.action !== "continue") {
         // Custom (non-built-in) events accept all directives — the plugin
         // author owns the contract for what each directive means.
         const supported = DIRECTIVE_SUPPORT[result.action]
@@ -554,15 +600,19 @@ async function emitHook(
     }
   }
 
-  for (const hook of hooks) if (hook.parallel === false) await runOne(hook)
+  for (const hook of hooks) if (hook.parallel === false) await runOne(hook, true)
   const parallel = hooks.filter(h => h.parallel !== false)
-  if (parallel.length > 0) await Promise.all(parallel.map(runOne))
+  if (parallel.length > 0) await Promise.all(parallel.map(h => runOne(h, false)))
 
   let winner: { directive: HookDirective; priority: number } = { directive: { action: "continue" }, priority: 100 }
   for (const d of directives) {
     const dRank = DIRECTIVE_RANK[d.directive.action] ?? 1
     const wRank = DIRECTIVE_RANK[winner.directive.action] ?? 1
     if (dRank > wRank || (dRank === wRank && d.priority < winner.priority)) winner = d
+  }
+  // If no flow-control directive won but hooks produced rewrites, surface them.
+  if (winner.directive.action === "continue" && Object.keys(cumulativePatch).length > 0) {
+    return { action: "rewrite", patch: cumulativePatch }
   }
   return winner.directive
 }
@@ -575,14 +625,14 @@ function abortIfHook(d: HookDirective): void {
 
 async function invokeAgent(
   node: GraphNode, state: RunState,
-  precomputed?: { userPrompt: string; systemPrompt: string },
+  precomputed?: { userPrompt?: string; systemPrompt?: string; model?: string; cwd?: string },
 ): Promise<AgentResult> {
   const def        = state.registry[node.agent!]
   const command    = state.overrides.provider ?? def.command
-  const model      = state.overrides.model ?? def.model
+  const model      = precomputed?.model ?? state.overrides.model ?? def.model
   const userPrompt = precomputed?.userPrompt  ?? renderUserPrompt(sliceContext(state.context, node.slice), node.instruction)
   const sysPrompt  = precomputed?.systemPrompt ?? buildSystemPrompt(state.registry, node)
-  const cwd        = resolve(state.context[`_worktree:${node.id}`] ?? node.cwd ?? process.cwd())
+  const cwd        = resolve(precomputed?.cwd ?? state.context[`_worktree:${node.id}`] ?? node.cwd ?? process.cwd())
   const logFile    = state.storage.logPath(state.runDir, node.id)
   const agentTimeout = node.timeout ?? 600_000  // default 10 minutes
 
@@ -601,30 +651,42 @@ async function runAgentPipeline(
 ): Promise<AgentResult | { redirected: true }> {
   if (!node.agent) throw new Error(`runAgent called without agent on node "${node.id}"`)
   const sliced     = sliceContext(state.context, node.slice)
-  const userPrompt = renderUserPrompt(sliced, node.instruction)
-  const sysPrompt  = buildSystemPrompt(state.registry, node)
+  let   userPrompt = renderUserPrompt(sliced, node.instruction)
+  let   sysPrompt  = buildSystemPrompt(state.registry, node)
   const def        = state.registry[node.agent]
   const command    = state.overrides.provider ?? def.command
-  const model      = state.overrides.model ?? def.model
+  let   model      = state.overrides.model ?? def.model
+  let   cwd        = resolve(node.cwd ?? process.cwd())
 
   const pre = await emitHook("PreAgent", {
     nodeId: node.id, agent: node.agent, provider: command,
     userPrompt, systemPrompt: sysPrompt, slicedContext: sliced,
   }, state)
-  if (await applyDirective(pre, state, node, fromNodeId)) return { redirected: true }
+  if (pre.action === "rewrite") {
+    if (typeof pre.patch.userPrompt   === "string") userPrompt = pre.patch.userPrompt
+    if (typeof pre.patch.systemPrompt === "string") sysPrompt  = pre.patch.systemPrompt
+  } else if (await applyDirective(pre, state, node, fromNodeId)) return { redirected: true }
 
   const logFile = state.storage.logPath(state.runDir, node.id)
   const preProv = await emitHook("PreProvider", {
     nodeId: node.id, agent: node.agent, provider: command,
-    userPrompt, systemPrompt: sysPrompt, cwd: resolve(node.cwd ?? process.cwd()), model, logFile,
+    userPrompt, systemPrompt: sysPrompt, cwd, model, logFile,
   }, state)
-  if (await applyDirective(preProv, state, node, fromNodeId)) return { redirected: true }
+  if (preProv.action === "rewrite") {
+    if (typeof preProv.patch.userPrompt   === "string") userPrompt = preProv.patch.userPrompt
+    if (typeof preProv.patch.systemPrompt === "string") sysPrompt  = preProv.patch.systemPrompt
+    if (typeof preProv.patch.model        === "string") model      = preProv.patch.model
+    if (typeof preProv.patch.cwd          === "string") cwd        = preProv.patch.cwd
+  } else if (await applyDirective(preProv, state, node, fromNodeId)) return { redirected: true }
 
-  const result = await invokeAgent(node, state, { userPrompt, systemPrompt: sysPrompt })
+  const result = await invokeAgent(node, state, { userPrompt, systemPrompt: sysPrompt, model, cwd })
   const post = await emitHook("PostAgent", {
     nodeId: node.id, agent: node.agent, provider: command, result, transcriptPath: result.transcriptPath,
   }, state)
-  if (await applyDirective(post, state, node, fromNodeId)) return { redirected: true }
+  if (post.action === "rewrite") {
+    if (typeof post.patch.output === "string") result.output = post.patch.output
+    if (typeof post.patch.choice === "string") result.choice = post.patch.choice
+  } else if (await applyDirective(post, state, node, fromNodeId)) return { redirected: true }
   return result
 }
 
