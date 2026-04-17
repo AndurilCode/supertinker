@@ -243,8 +243,12 @@ function buildCompletionEvent(runId: string): string {
     // Cap the blob so the director's prompt stays reasonable on big runs.
     contextBlob = raw.length > 4000 ? raw.slice(0, 4000) + "\n…(truncated)" : raw
   } catch {}
+  // Prefix avoids square brackets — the validate-templates hook treats any
+  // [word] in an instruction/event as a template reference and aborts the
+  // run if it doesn't resolve. "WORKFLOW-COMPLETE::" is unambiguous and
+  // safe. Keep it in sync with the director's system prompt.
   return [
-    `[workflow-complete] run=${runId} workflow=${workflowId} status=${status}`,
+    `WORKFLOW-COMPLETE:: run=${runId} workflow=${workflowId} status=${status}`,
     `Final context (${dir}/context.json):`,
     contextBlob,
   ].join("\n")
