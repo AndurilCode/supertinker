@@ -327,22 +327,40 @@ function Chat({ runId, workflow, choice, contextKey, replyKey, initial }: ChatPr
   // re-renders them — without this, a terminal resize causes Ink to redraw
   // every prior line, producing the scrambled "Run a code-review… Run a
   // code-review…" overlap you see when the scrollback is long.
+  //
+  // The header is the first Static item so it's printed once at the TOP of
+  // scrollback and stays pinned above everything (dynamic content — input,
+  // footer — always sits below Static output, so keeping Header dynamic
+  // would make it slide below every new user message).
+  type StaticItem =
+    | { kind: "header"; k: string }
+    | { kind: "msg"; k: string; msg: Msg }
+  const items: StaticItem[] = [
+    { kind: "header", k: "header" },
+    ...messages.map((m, i): StaticItem => ({ kind: "msg", k: `m-${i}`, msg: m })),
+  ]
   return (
     <Box flexDirection="column">
-      <Static items={messages.map((m, i) => ({ ...m, key: i }))}>
-        {(m) => (
-          <Box key={m.key} flexDirection="column" marginBottom={1}>
-            {m.role === "user" && (
-              <Text><Text color="cyan" bold>❯ </Text><Text>{m.text}</Text></Text>
-            )}
-            {m.role === "agent" && (
-              <Text>{renderMarkdown(m.text)}</Text>
-            )}
-            {m.role === "system" && (
-              <Text dimColor>{m.text}</Text>
-            )}
-          </Box>
-        )}
+      <Static items={items}>
+        {(item) => {
+          if (item.kind === "header") {
+            return <Header key={item.k} workflow={workflow} runId={runId} />
+          }
+          const m = item.msg
+          return (
+            <Box key={item.k} flexDirection="column" marginBottom={1}>
+              {m.role === "user" && (
+                <Text><Text color="cyan" bold>❯ </Text><Text>{m.text}</Text></Text>
+              )}
+              {m.role === "agent" && (
+                <Text>{renderMarkdown(m.text)}</Text>
+              )}
+              {m.role === "system" && (
+                <Text dimColor>{m.text}</Text>
+              )}
+            </Box>
+          )
+        }}
       </Static>
 
       <Box marginTop={1} marginBottom={1}>
@@ -468,11 +486,10 @@ function App({ runId: initialRunId, workflow, choice, contextKey, replyKey }: Ap
       </Box>
     )
   }
+  // Chat renders its own Header as the first Static item so it sticks to the
+  // top of scrollback. Don't render a Header here too — would double-print.
   return (
-    <Box flexDirection="column">
-      <Header workflow={workflow} runId={runId} />
-      <Chat runId={runId} workflow={workflow} choice={choice} contextKey={contextKey} replyKey={replyKey} initial={initial} />
-    </Box>
+    <Chat runId={runId} workflow={workflow} choice={choice} contextKey={contextKey} replyKey={replyKey} initial={initial} />
   )
 }
 
