@@ -15,7 +15,9 @@ import { createRequire }                                        from "module"
 
 export interface GraphNode {
   id:           string
-  type?:        "fork" | "join" | "done" | "failed" | "paused" | "subworkflow"
+  // Built-ins: "fork" | "join" | "done" | "failed" | "paused" | "subworkflow"
+  // Or any custom type registered via plugins/nodes/<name>.ts
+  type?:        string
   agent?:       string
   cwd?:         string
   slice?:       string[]
@@ -162,18 +164,31 @@ interface RunState {
   joinMap: Map<string, Set<string>>; iterationCounts: Map<string, number>
   graph: Graph; registry: AgentRegistry; guardrails: Guardrails; hooks: HookIndex
   storage: StorageAdapter; overrides: ProviderOverrides
+  nodeTypes: NodeTypeRegistry
 }
 
 // ─── HOOKS
 
-export type HookEventName =
+// Built-in lifecycle event names. Custom node-type plugins may emit any
+// additional string event name via ctx.emitHook; hook plugins subscribe by
+// listing the same string in their `events` array.
+export type BuiltinHookEvent =
   | "RunStart" | "RunEnd"
+  | "NodeStart" | "NodeEnd"
   | "PreAgent" | "PostAgent" | "PreProvider"
   | "Paused"   | "Resumed"
   | "ForkStart" | "ForkJoin"
   | "GuardrailFail"
   | "SubworkflowStart" | "SubworkflowEnd"
   | "Error"
+
+export const BUILTIN_HOOK_EVENTS: BuiltinHookEvent[] = [
+  "RunStart", "RunEnd", "NodeStart", "NodeEnd",
+  "PreAgent", "PostAgent", "PreProvider", "Paused", "Resumed",
+  "ForkStart", "ForkJoin", "GuardrailFail", "SubworkflowStart", "SubworkflowEnd", "Error",
+]
+
+export type HookEventName = BuiltinHookEvent | string
 
 export interface HookEventBase {
   event:     HookEventName
@@ -186,6 +201,8 @@ export interface HookEventBase {
 interface HookEventMap {
   RunStart:         { workflow: Workflow; initialContext: Context }
   RunEnd:           { terminal: "done" | "failed"; finalContext: Context }
+  NodeStart:        { nodeId: string; nodeType: string; from: string | null }
+  NodeEnd:          { nodeId: string; nodeType: string; to: string | null }
   PreAgent:         { nodeId: string; agent: string; provider: string; userPrompt: string; systemPrompt: string; slicedContext: Context }
   PostAgent:        { nodeId: string; agent: string; provider: string; result: AgentResult; transcriptPath?: string }
   PreProvider:      { nodeId: string; agent: string; provider: string; userPrompt: string; systemPrompt: string; cwd: string; model?: string; logFile: string }
@@ -199,7 +216,9 @@ interface HookEventMap {
   Error:            { nodeId: string; error: string; fallbackNodeId?: string }
 }
 
-export type HookEvent = { [K in HookEventName]: HookEventBase & { event: K } & HookEventMap[K] }[HookEventName]
+export type HookEvent =
+  | { [K in BuiltinHookEvent]: HookEventBase & { event: K } & HookEventMap[K] }[BuiltinHookEvent]
+  | (HookEventBase & { event: string } & Record<string, unknown>)
 
 export type HookDirective =
   | { action: "continue" }
@@ -219,6 +238,55 @@ export interface Hook {
 }
 
 export type HookIndex = Map<HookEventName, Hook[]>
+
+// ─── NODE TYPE PLUGINS
+
+// Built-in node types are dispatched directly inside executeNode. Custom
+// types are loaded from <SEARCH_DIR>/nodes/<name>.{ts,js} and rejected at
+// load time if they collide with a built-in.
+export const BUILTIN_NODE_TYPES = new Set<string>([
+  "fork", "join", "done", "failed", "paused", "subworkflow",
+])
+
+export interface NodeExecuteCtx {
+  node:        GraphNode
+  fromNodeId:  string | null
+  context:     Context                       // mutable; === state.context
+  runId:       string
+  runDir:      string
+  storage:     StorageAdapter
+
+  // Helpers — the stable surface custom nodes should rely on:
+  slice:           (keys?: string[]) => Context
+  render:          (instruction?: string, keys?: string[]) => string
+  saveContext:     () => Promise<void>
+  executeNode:     (nodeId: string, fromNodeId: string | null) => Promise<void>
+  invokeAgent:     (node: GraphNode, pre?: { userPrompt: string; systemPrompt: string }) => Promise<AgentResult>
+  // Wraps invokeAgent with PreAgent → PreProvider → invokeAgent → PostAgent
+  // emission and directive handling — same semantics as the standard-agent
+  // path. Returns { redirected: true } when a hook redirected/skipped/paused
+  // the flow and the caller should stop driving execution itself.
+  runAgent:        (node: GraphNode) => Promise<AgentResult | { redirected: true }>
+  emitHook:        (event: HookEventName, payload: Record<string, unknown>) => Promise<HookDirective>
+  writePause:      (reason?: string) => Promise<void>
+  errorFallback:   (error: string) => Promise<void>
+  resolveFallback: () => string
+  log:             (line: string) => Promise<void>
+}
+
+export interface NodeTypeDefinition {
+  type:         string
+  description?: string
+  schema?: {
+    requires?: string[]
+    optional?: string[]
+    example?:  Partial<GraphNode>            // copied verbatim by the meta architect
+  }
+  validate?: (node: GraphNode, graph: Graph) => string | null  // null = ok
+  execute:   (ctx: NodeExecuteCtx) => Promise<void>
+}
+
+export type NodeTypeRegistry = Map<string, NodeTypeDefinition>
 
 // ─── CONTEXT
 
@@ -292,20 +360,81 @@ export async function loadStorage(): Promise<StorageAdapter> {
   return { ...filesystemStorage, ...adapter }  // merge: custom overrides only what it defines
 }
 
+// ─── NODE TYPE LOADER
+
+async function readNodeTypePlugins(): Promise<Array<{ def: NodeTypeDefinition; source: string; file: string }>> {
+  const out: Array<{ def: NodeTypeDefinition; source: string; file: string }> = []
+  const dirs: Array<[string, string]> = [
+    [join(PROJECT_DIR, "nodes"), "project"],
+    [join(USER_DIR,    "nodes"), "user"],
+    [join(BUILTIN_DIR, "nodes"), "built-in"],
+  ]
+  for (const [dir, source] of dirs) {
+    if (!existsSync(dir)) continue
+    let files: string[]
+    try { files = readdirSync(dir).filter((f: string) => f.endsWith(".ts") || f.endsWith(".js")) } catch { continue }
+    for (const file of files) {
+      try {
+        const mod = await import(join(dir, file))
+        const def = (mod.node ?? mod.default?.node) as NodeTypeDefinition | undefined
+        if (!def || typeof def.execute !== "function" || !def.type) continue
+        out.push({ def, source, file })
+      } catch {}
+    }
+  }
+  return out
+}
+
+export async function loadNodeTypes(runDir: string): Promise<NodeTypeRegistry> {
+  const registry: NodeTypeRegistry = new Map()
+  const loaded: string[] = []
+  const plugins = await readNodeTypePlugins()
+  for (const { def, file } of plugins) {
+    if (BUILTIN_NODE_TYPES.has(def.type)) {
+      bootstrapLog(runDir, `WARN: skipping ${file} — node type "${def.type}" shadows a built-in`)
+      continue
+    }
+    if (registry.has(def.type)) continue  // first match (project > user > built-in) wins
+    registry.set(def.type, def)
+    loaded.push(def.type)
+  }
+  if (loaded.length > 0) bootstrapLog(runDir, `node-types loaded: ${loaded.join(", ")}`)
+  else bootstrapLog(runDir, "no custom node types found")
+  return registry
+}
+
+export async function buildNodeCatalog(): Promise<string> {
+  const plugins = await readNodeTypePlugins()
+  const seen = new Set<string>()
+  const entries: NodeTypeDefinition[] = []
+  for (const { def } of plugins) {
+    if (BUILTIN_NODE_TYPES.has(def.type) || seen.has(def.type)) continue
+    seen.add(def.type)
+    entries.push(def)
+  }
+  if (entries.length === 0) return "No custom node types."
+  const lines = entries.map(e => {
+    const example = e.schema?.example ? `\n  example: ${JSON.stringify(e.schema.example)}` : ""
+    const requires = e.schema?.requires?.length ? `\n  requires: ${e.schema.requires.join(", ")}` : ""
+    return `- ${e.type}: ${e.description ?? "(no description)"}${requires}${example}`
+  })
+  return `Custom node types (${entries.length}):\n${lines.join("\n")}`
+}
+
 // ─── HOOK SYSTEM
 
-const VALID_EVENTS = new Set<HookEventName>([
-  "RunStart", "RunEnd", "PreAgent", "PostAgent", "PreProvider", "Paused", "Resumed",
-  "ForkStart", "ForkJoin", "GuardrailFail", "SubworkflowStart", "SubworkflowEnd", "Error",
-])
+const VALID_EVENTS = new Set<HookEventName>(BUILTIN_HOOK_EVENTS)
 
 const DIRECTIVE_RANK: Record<string, number> = {
   abort: 5, pause: 4, redirect: 3, skip: 2, continue: 1,
 }
 
+// Directive support is enforced for built-in events only. Custom event names
+// (defined by node-type plugins) accept all directives — the plugin author
+// owns the contract for what each directive means in their event.
 const DIRECTIVE_SUPPORT: Record<string, Set<HookEventName>> = {
   abort:    new Set(VALID_EVENTS),
-  pause:    new Set(["PreAgent", "PreProvider", "PostAgent", "GuardrailFail", "SubworkflowStart"]),
+  pause:    new Set(["PreAgent", "PreProvider", "PostAgent", "GuardrailFail", "SubworkflowStart", "NodeStart"]),
   redirect: new Set(["PreAgent", "PreProvider", "PostAgent"]),
   skip:     new Set(["PreAgent", "PreProvider"]),
   continue: new Set(VALID_EVENTS),
@@ -338,10 +467,15 @@ export async function loadHooks(runDir: string): Promise<HookIndex> {
           continue
         }
 
+        // Accept any non-empty string event name. Built-in events come pre-keyed
+        // in the index; custom events (from node-type plugins) are added on demand.
+        const events: HookEventName[] = (h.events as unknown[])
+          .filter((e): e is string => typeof e === "string" && e.length > 0)
+
         const hook: Hook = {
           name:     h.name,
           description: h.description,
-          events:   h.events.filter((e: string) => VALID_EVENTS.has(e as HookEventName)) as HookEventName[],
+          events,
           parallel: h.parallel ?? true,
           priority: h.priority ?? 50,
           timeout:  h.timeout ?? 30000,
@@ -354,6 +488,7 @@ export async function loadHooks(runDir: string): Promise<HookIndex> {
         }
 
         for (const evt of hook.events) {
+          if (!index.has(evt)) index.set(evt, [])
           index.get(evt)!.push(hook)
         }
         loaded.push(`${hook.name} (${hook.events.join(", ")})`)
@@ -391,6 +526,7 @@ async function emitHook(
     ...payload,
   } as HookEvent
 
+  const isBuiltinEvent = VALID_EVENTS.has(event)
   const directives: Array<{ directive: HookDirective; priority: number }> = []
 
   const runOne = async (hook: Hook): Promise<void> => {
@@ -403,7 +539,9 @@ async function emitHook(
       let directive: HookDirective = result
       if (result.action !== "continue") {
         const supported = DIRECTIVE_SUPPORT[result.action]
-        if (!supported?.has(event)) {
+        // For custom (non-built-in) events, all directives are allowed —
+        // the plugin author owns the contract.
+        if (isBuiltinEvent && !supported?.has(event)) {
           process.stderr.write(`HOOK-WARN ${hook.name}: "${result.action}" not supported for ${event}, treating as continue\n`)
           directive = { action: "continue" }
         } else if (result.action === "redirect") {
@@ -528,10 +666,32 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
   const node = graph.nodes.find(n => n.id === nodeId)
   if (!node) throw new Error(`Node not found: "${nodeId}"`)
 
+  // ── Universal lifecycle: NodeStart fires once per node arrival, before any
+  // type-specific event (PreAgent, ForkStart, SubworkflowStart, …).
+  const nodeType = node.type ?? "standard"
+  const nodeStartDirective = await emitHook("NodeStart", { nodeId, nodeType, from: fromNodeId }, state)
+  if (nodeStartDirective.action === "abort") throw new Error(`Aborted by hook: ${(nodeStartDirective as { reason: string }).reason}`)
+  if (nodeStartDirective.action === "pause") {
+    await writePause(state, nodeId, fromNodeId, (nodeStartDirective as { reason: string }).reason)
+    return
+  }
+
   // ── Terminals
-  if (node.type === "done")   { await emitHook("RunEnd", { terminal: "done", finalContext: context }, state); return }
-  if (node.type === "failed") { await emitHook("RunEnd", { terminal: "failed", finalContext: context }, state); throw new Error("Graph reached failed terminal") }
-  if (node.type === "paused") { await writePause(state, nodeId, fromNodeId); return }
+  if (node.type === "done")   {
+    await emitHook("NodeEnd",  { nodeId, nodeType, to: null }, state)
+    await emitHook("RunEnd",   { terminal: "done", finalContext: context }, state)
+    return
+  }
+  if (node.type === "failed") {
+    await emitHook("NodeEnd",  { nodeId, nodeType, to: null }, state)
+    await emitHook("RunEnd",   { terminal: "failed", finalContext: context }, state)
+    throw new Error("Graph reached failed terminal")
+  }
+  if (node.type === "paused") {
+    await emitHook("NodeEnd",  { nodeId, nodeType, to: null }, state)
+    await writePause(state, nodeId, fromNodeId)
+    return
+  }
 
   // ── Fork
   if (node.type === "fork") {
@@ -539,6 +699,7 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
     if (directive.action === "abort") throw new Error(`Aborted by hook: ${(directive as { reason: string }).reason}`)
     await Promise.all(node.targets!.map(t => executeNode(t, nodeId, state)))
     await emitHook("ForkJoin", { nodeId, joinedFrom: node.targets! }, state)
+    await emitHook("NodeEnd",  { nodeId, nodeType, to: null }, state)
     return
   }
 
@@ -547,7 +708,10 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
     if (!joinMap.has(nodeId)) joinMap.set(nodeId, new Set())
     const arrived = joinMap.get(nodeId)!
     if (fromNodeId) arrived.add(fromNodeId)
-    if (arrived.size < node.waits_for!.length) return
+    if (arrived.size < node.waits_for!.length) {
+      await emitHook("NodeEnd", { nodeId, nodeType, to: null }, state)
+      return
+    }
   }
 
   // ── Subworkflow
@@ -588,6 +752,7 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
       overrides: state.overrides,
       hooks: state.hooks,
       storage: state.storage,
+      nodeTypes: state.nodeTypes,
     }
 
     try { await executeNode(inner.graph.start, null, innerState) }
@@ -600,7 +765,23 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
     await emitHook("SubworkflowEnd", { nodeId, innerContext: innerState.context }, state)
 
     const next = node.options?.["done"]
+    await emitHook("NodeEnd", { nodeId, nodeType, to: next ?? null }, state)
     if (next) return executeNode(next, nodeId, state)
+    return
+  }
+
+  // ── Custom node types (plugins)
+  if (node.type && !BUILTIN_NODE_TYPES.has(node.type)) {
+    const def = state.nodeTypes.get(node.type)
+    if (!def) return errorFallback(state, nodeId, node,
+      `unknown node.type "${node.type}" — no built-in handler and no plugin in <search>/nodes/`)
+    if (def.validate) {
+      const err = def.validate(node, state.graph)
+      if (err) return errorFallback(state, nodeId, node, `node-type validation: ${err}`)
+    }
+    try { await def.execute(buildNodeExecuteCtx(node, fromNodeId, state)) }
+    catch (err) { return errorFallback(state, nodeId, node, String(err)) }
+    await emitHook("NodeEnd", { nodeId, nodeType, to: null }, state)
     return
   }
 
@@ -634,7 +815,9 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
     userPrompt, systemPrompt: sysPrompt, slicedContext: sliced,
   }, state)
 
-  if (await applyDirective(preDirective, state, nodeId, node, fromNodeId)) return
+  if (await applyDirective(preDirective, state, nodeId, node, fromNodeId)) {
+    await emitHook("NodeEnd", { nodeId, nodeType, to: null }, state); return
+  }
 
   const logFile = state.storage.logPath(state.runDir, node.id)
   const preProviderDirective = await emitHook("PreProvider", {
@@ -642,7 +825,9 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
     userPrompt, systemPrompt: sysPrompt, cwd: resolve(node.cwd ?? process.cwd()), model,
     logFile,
   }, state)
-  if (await applyDirective(preProviderDirective, state, nodeId, node, fromNodeId)) return
+  if (await applyDirective(preProviderDirective, state, nodeId, node, fromNodeId)) {
+    await emitHook("NodeEnd", { nodeId, nodeType, to: null }, state); return
+  }
 
   let result: AgentResult
   try { result = await invokeAgent(node, state, { userPrompt, systemPrompt: sysPrompt }) }
@@ -652,7 +837,9 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
     nodeId, agent: node.agent!, provider: command, result, transcriptPath: result.transcriptPath,
   }, state)
 
-  if (await applyDirective(postDirective, state, nodeId, node, fromNodeId)) return
+  if (await applyDirective(postDirective, state, nodeId, node, fromNodeId)) {
+    await emitHook("NodeEnd", { nodeId, nodeType, to: null }, state); return
+  }
 
   // Post-guardrails — retry once, then pause
   if (guardrails.post?.length) {
@@ -677,7 +864,61 @@ async function executeNode(nodeId: string, fromNodeId: string | null, state: Run
 
   context[nodeId] = result.output
   await saveContext(state)
+  await emitHook("NodeEnd", { nodeId, nodeType, to: nextNodeId }, state)
   return executeNode(nextNodeId, nodeId, state)
+}
+
+// Builds the helper object passed to NodeTypeDefinition.execute.
+function buildNodeExecuteCtx(node: GraphNode, fromNodeId: string | null, state: RunState): NodeExecuteCtx {
+  return {
+    node,
+    fromNodeId,
+    context: state.context,
+    runId:   state.runId,
+    runDir:  state.runDir,
+    storage: state.storage,
+    slice:        (keys) => sliceContext(state.context, keys),
+    render:       (instruction, keys) => renderUserPrompt(sliceContext(state.context, keys), instruction),
+    saveContext:  () => saveContext(state),
+    executeNode:  (id, from) => executeNode(id, from, state),
+    invokeAgent:  (n, pre) => invokeAgent(n, state, pre),
+    runAgent:     async (n) => {
+      // Mirrors the standard-agent path so hooks (PreAgent/PreProvider/PostAgent
+      // and their directives) fire identically when a custom node calls an agent.
+      if (!n.agent) throw new Error(`runAgent called without agent on node "${n.id}"`)
+      const sliced     = sliceContext(state.context, n.slice)
+      const userPrompt = renderUserPrompt(sliced, n.instruction)
+      const sysPrompt  = buildSystemPrompt(state.registry, n)
+      const def        = state.registry[n.agent]
+      const command    = state.overrides.provider ?? def.command
+      const model      = state.overrides.model ?? def.model
+
+      const pre = await emitHook("PreAgent", {
+        nodeId: n.id, agent: n.agent, provider: command,
+        userPrompt, systemPrompt: sysPrompt, slicedContext: sliced,
+      }, state)
+      if (await applyDirective(pre, state, n.id, n, fromNodeId)) return { redirected: true }
+
+      const logFile = state.storage.logPath(state.runDir, n.id)
+      const preProv = await emitHook("PreProvider", {
+        nodeId: n.id, agent: n.agent, provider: command,
+        userPrompt, systemPrompt: sysPrompt, cwd: resolve(n.cwd ?? process.cwd()), model, logFile,
+      }, state)
+      if (await applyDirective(preProv, state, n.id, n, fromNodeId)) return { redirected: true }
+
+      const result = await invokeAgent(n, state, { userPrompt, systemPrompt: sysPrompt })
+      const post = await emitHook("PostAgent", {
+        nodeId: n.id, agent: n.agent, provider: command, result, transcriptPath: result.transcriptPath,
+      }, state)
+      if (await applyDirective(post, state, n.id, n, fromNodeId)) return { redirected: true }
+      return result
+    },
+    emitHook:        (event, payload) => emitHook(event, payload, state),
+    writePause:      (reason) => writePause(state, node.id, fromNodeId, reason),
+    errorFallback:   (error) => errorFallback(state, node.id, node, error),
+    resolveFallback: () => resolveFallback(node, state.graph),
+    log:             (line) => state.storage.appendLog(state.runDir, line),
+  }
 }
 
 // ─── WORKFLOW LIBRARY
@@ -699,10 +940,12 @@ export async function run({ workflow, initialContext = {}, overrides = {} }: { w
   const runDir = await storage.createRun(runId)
 
   const hooks = await loadHooks(runDir)
+  const nodeTypes = await loadNodeTypes(runDir)
 
   const state: RunState = {
     runId, runDir, context: { ...initialContext }, joinMap: new Map(),
     iterationCounts: new Map(), graph, registry, guardrails: workflow.guardrails ?? {}, hooks, storage, overrides,
+    nodeTypes,
   }
 
   const startDirective = await emitHook("RunStart", { workflow, initialContext }, state)
@@ -721,6 +964,7 @@ export async function resume({ workflow, runId, choice, overrides = {} }: { work
 
   const paused = await storage.loadPause(runDir)
   const hooks = await loadHooks(runDir)
+  const nodeTypes = await loadNodeTypes(runDir)
   const fromNode = graph.nodes.find(n => n.id === paused.nodeId)
   if (!fromNode?.options?.[choice]) throw new Error(`Choice "${choice}" not valid for "${paused.nodeId}". Options: ${Object.keys(fromNode?.options ?? {})}`)
 
@@ -728,6 +972,7 @@ export async function resume({ workflow, runId, choice, overrides = {} }: { work
   const state: RunState = {
     runId, runDir, context: paused.context, joinMap: new Map(),
     iterationCounts: restoredIterations, graph, registry, guardrails: workflow.guardrails ?? {}, hooks, storage, overrides,
+    nodeTypes,
   }
 
   const resumeDirective = await emitHook("Resumed", { nodeId: paused.nodeId, choice }, state)

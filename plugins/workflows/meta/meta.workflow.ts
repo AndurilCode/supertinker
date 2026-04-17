@@ -22,6 +22,7 @@ NODE TYPES (by example):
   Join:     { "id": "x", "type": "join", "waits_for": ["a", "b"], "agent": "a", "instruction": "...", "options": {"done": "next"} }
   Done:     { "id": "x", "type": "done" }
   Paused:   { "id": "x", "type": "paused" }
+  Custom:   any type listed in [nodeCatalog] — copy its example shape verbatim, adjusting only ids and option targets.
 
 PATTERNS:
   Review loop — point an option edge backward: { "approved": "done_node", "needs_work": "implement_node" }
@@ -72,7 +73,11 @@ If any fail, select "misaligned" and explain specifically what is wrong: name th
 
   guardrails: {
     post: [
-      // Comprehensive graph validation for architect output
+      // Comprehensive graph validation for architect output.
+      // Note: structural checks below (fork.targets, join.waits_for, terminal
+      // nodes, reachability) only fire for known built-in types. Unknown
+      // node.type values are accepted here and validated at runtime by the
+      // matching node-type plugin (see plugins/nodes/<type>/<type>.ts).
       ({ nodeId, output }) => {
         if (nodeId !== "design" || !output) return { pass: true }
 
@@ -192,7 +197,7 @@ If any fail, select "misaligned" and explain specifically what is wrong: name th
       {
         id: "design",
         agent: "architect",
-        instruction: "The working directory is [cwd]. Check it for any existing artifacts relevant to the task — don't redo work that's already done. Check the workflow library in [catalog]. If an existing workflow matches the task in [task], output it as-is or with modifications. Only design from scratch if nothing fits. Set cwd on agent nodes to [cwd] when the task targets an existing project. Output ONLY the raw Workflow JSON.",
+        instruction: "The working directory is [cwd]. Check it for any existing artifacts relevant to the task — don't redo work that's already done. Check the workflow library in [catalog]. If an existing workflow matches the task in [task], output it as-is or with modifications. Only design from scratch if nothing fits. Also consult [nodeCatalog] for custom node types available in this environment — use them when they fit the task by copying their example shape verbatim. Set cwd on agent nodes to [cwd] when the task targets an existing project. Output ONLY the raw Workflow JSON.",
         options: {
           done: "review"
         }
