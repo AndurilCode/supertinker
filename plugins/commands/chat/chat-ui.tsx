@@ -160,17 +160,16 @@ function scanActiveRuns(currentRunId: string, sessionStartMs: number): RunStatus
   const pausedCutoff = process.env.CHAT_STALE_PAUSED_MS
     ? now - STALE_PAUSED_MS
     : sessionStartMs
+  // The chat's own run is excluded — the footer is a window into work the
+  // chat spawned (or pre-existing runs active in this session), not a
+  // redundant display of the run you're currently talking to.
   const active = entries.filter(e => {
-    if (e.isCurrent) return true
+    if (e.isCurrent) return false
     if (e.status === "running") return true   // classifier already applied the running-stale window
     if (e.status === "paused")  return e.mtimeMs >= pausedCutoff
     return false
   })
-  active.sort((a, b) => {
-    if (a.isCurrent && !b.isCurrent) return -1
-    if (!a.isCurrent && b.isCurrent) return 1
-    return b.mtimeMs - a.mtimeMs
-  })
+  active.sort((a, b) => b.mtimeMs - a.mtimeMs)
   return active
 }
 
