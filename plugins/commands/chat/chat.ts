@@ -15,18 +15,16 @@ import type { CommandPlugin }     from "../../../cli.js"
 export const command: CommandPlugin = {
   name: "chat",
   description: "interactive REPL (Ink TUI) for persistent-agent workflows",
-  usage: "chat --workflow <name> [--run <runId>] [--choice <label>=event] [--context-key <k>=event] [--reply-key <k>]",
+  usage: "chat [--workflow <name>] [--run <runId>] [--choice <label>=event] [--context-key <k>=event] [--reply-key <k>]   # workflow defaults to 'director'",
   async handler(_args, get) {
-    const workflow   = get("--workflow")
+    // Default to 'director' — the canonical persistent-agent workflow shipped
+    // with supertinker. Any other persistent-style workflow still works via
+    // --workflow explicitly.
+    const workflow   = get("--workflow")    ?? "director"
     const runId      = get("--run")
     const choice     = get("--choice")      ?? "event"
     const contextKey = get("--context-key") ?? "event"
     const replyKey   = get("--reply-key")   ?? workflow
-
-    if (!workflow) {
-      console.error("Usage: supertinker chat --workflow <name> [--run <id>]")
-      process.exit(1)
-    }
 
     // Clear terminal (scrollback + visible) so the prior shell prompt doesn't
     // bleed into the chat UI. Ink renders from cursor-home onward.
