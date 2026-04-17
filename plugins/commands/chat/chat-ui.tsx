@@ -8,7 +8,7 @@
  */
 
 import { useEffect, useState } from "react"
-import { render, Box, Text, useInput, useApp } from "ink"
+import { render, Box, Static, Text, useInput, useApp } from "ink"
 import Spinner from "ink-spinner"
 import {
   existsSync, readFileSync, writeFileSync, statSync, readdirSync,
@@ -321,11 +321,15 @@ function Chat({ runId, workflow, choice, contextKey, replyKey, initial }: ChatPr
     if (char && char.length > 0) setInput(i => i + char)
   })
 
+  // Past messages go through <Static> so Ink writes them once and never
+  // re-renders them — without this, a terminal resize causes Ink to redraw
+  // every prior line, producing the scrambled "Run a code-review… Run a
+  // code-review…" overlap you see when the scrollback is long.
   return (
     <Box flexDirection="column">
-      <Box flexDirection="column" marginBottom={1}>
-        {messages.map((m, i) => (
-          <Box key={i} flexDirection="column" marginBottom={1}>
+      <Static items={messages.map((m, i) => ({ ...m, key: i }))}>
+        {(m) => (
+          <Box key={m.key} flexDirection="column" marginBottom={1}>
             {m.role === "user" && (
               <Text><Text color="cyan" bold>❯ </Text><Text>{m.text}</Text></Text>
             )}
@@ -336,8 +340,8 @@ function Chat({ runId, workflow, choice, contextKey, replyKey, initial }: ChatPr
               <Text dimColor>{m.text}</Text>
             )}
           </Box>
-        ))}
-      </Box>
+        )}
+      </Static>
 
       <Box marginTop={1} marginBottom={1}>
         {thinking ? (
