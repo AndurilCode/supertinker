@@ -1,6 +1,6 @@
 # Constitution:
 - supertinker.ts must remain a single file, with zero dependencies. 
-- It's supposed to be a core that can be extended indefinitely, through hooks, providers, workflows, storage adapters.
+- It's supposed to be a core that can be extended indefinitely, through hooks, providers, workflows, storage adapters, commands.
 - While iterating on this codebase to add new features, the @supertinker.ts must remain unchanged, as soon as it's not strictly necessary (meaning that the supertinker.ts capability to be fully extensible is not yet fulfilled).
 - While ideating the solution, firstly rely on the extensions/plugins mechanisms available.
 - Plugins must always be placed in the `plugins/` folder in this project, never directly in `.supertinker/`.
