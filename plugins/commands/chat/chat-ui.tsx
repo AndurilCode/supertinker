@@ -7,7 +7,7 @@
  * state + effects in this component.
  */
 
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
 import { render, Box, Static, Text, useInput, useApp } from "ink"
 import Spinner from "ink-spinner"
 import {
@@ -225,6 +225,31 @@ function runResume(runId: string, choice: string, workflow: string): Promise<num
 // ─── Message list ─────────────────────────────────────────────────────────
 interface Msg { role: "user" | "agent" | "system"; text: string }
 
+// Compose the event text injected into the director's context when a
+// launched workflow completes. Format is stable and prefixed so the
+// director's system prompt can recognise & route it specifically (a human
+// message would never start with "[workflow-complete]").
+function buildCompletionEvent(runId: string): string {
+  const dir  = join(RUN_ROOT, runId)
+  const workflowId = runId.replace(/-\d+$/, "")
+  let status = "done"
+  try {
+    const log = readFileSync(join(dir, "orchestrator.log"), "utf8")
+    if (/^\[[^\]]+\]\s+FAILED\s+graph/m.test(log)) status = "failed"
+  } catch {}
+  let contextBlob = "(no context.json on disk)"
+  try {
+    const raw = readFileSync(join(dir, "context.json"), "utf8")
+    // Cap the blob so the director's prompt stays reasonable on big runs.
+    contextBlob = raw.length > 4000 ? raw.slice(0, 4000) + "\n…(truncated)" : raw
+  } catch {}
+  return [
+    `[workflow-complete] run=${runId} workflow=${workflowId} status=${status}`,
+    `Final context (${dir}/context.json):`,
+    contextBlob,
+  ].join("\n")
+}
+
 // ─── Main component ───────────────────────────────────────────────────────
 interface ChatProps {
   runId:      string
@@ -261,7 +286,54 @@ function Chat({ runId, workflow, choice, contextKey, replyKey, initial }: ChatPr
     return () => clearInterval(t)
   }, [runId, sessionStartMs])
 
-  const submit = async (text: string) => {
+  // ── Auto-announce completed child runs to the director ──────────────────
+  // When a workflow the director launched finishes, we want the director to
+  // see it as a new event and summarize the result for the user. If the
+  // director is currently processing another turn, we queue the notification
+  // and drain it once it's idle.
+  //
+  // announcedRef: run IDs we've already handled (or that were already in
+  //               terminal state when the chat started — we don't want to
+  //               announce stale completions from before this session).
+  // pending:      FIFO queue of completions waiting to be injected.
+  const announcedRef = useRef<Set<string>>(new Set())
+  const [pending, setPending] = useState<string[]>([])
+  const announcedInit = useRef(false)
+
+  useEffect(() => {
+    if (announcedInit.current) return
+    announcedInit.current = true
+    try {
+      for (const n of readdirSync(RUN_ROOT)) {
+        const dir = join(RUN_ROOT, n)
+        try { if (!statSync(dir).isDirectory()) continue } catch { continue }
+        const s = classifyRun(dir, n, runId)
+        if (s && (s.status === "done" || s.status === "failed")) announcedRef.current.add(n)
+      }
+    } catch {}
+    // Don't announce the chat's own run either — even if it finishes, the
+    // user would see that via the header, not via an injected event.
+    announcedRef.current.add(runId)
+  }, [runId])
+
+  useEffect(() => {
+    const t = setInterval(() => {
+      try {
+        for (const n of readdirSync(RUN_ROOT)) {
+          if (announcedRef.current.has(n)) continue
+          const dir = join(RUN_ROOT, n)
+          try { if (!statSync(dir).isDirectory()) continue } catch { continue }
+          const s = classifyRun(dir, n, runId)
+          if (!s || (s.status !== "done" && s.status !== "failed")) continue
+          announcedRef.current.add(n)
+          setPending(q => [...q, n])
+        }
+      } catch {}
+    }, 1000)
+    return () => clearInterval(t)
+  }, [runId])
+
+  const submit = async (text: string, opts?: { system?: boolean }) => {
     const trimmed = text.trim()
     if (!trimmed) return
 
@@ -290,7 +362,7 @@ function Chat({ runId, workflow, choice, contextKey, replyKey, initial }: ChatPr
       return
     }
 
-    setMessages(m => [...m, { role: "user", text: trimmed }])
+    setMessages(m => [...m, { role: opts?.system ? "system" : "user", text: trimmed }])
     setThinking(true)
     try {
       const state = readState(runDir)
@@ -312,6 +384,20 @@ function Chat({ runId, workflow, choice, contextKey, replyKey, initial }: ChatPr
       setThinking(false)
     }
   }
+
+  // Drain the queued workflow-complete notifications one at a time, only
+  // when the director is idle. This runs in effect so React has flushed the
+  // `thinking=false` state before we inject the next turn.
+  useEffect(() => {
+    if (thinking || pending.length === 0) return
+    const [next, ...rest] = pending
+    setPending(rest)
+    const event = buildCompletionEvent(next)
+    void submit(event, { system: true })
+    // submit is intentionally omitted from deps — closing over the current
+    // runId/workflow/… is fine because those never change for a Chat instance.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [thinking, pending])
 
   useInput((char, key) => {
     if (key.ctrl && char === "c") { exit(); return }
