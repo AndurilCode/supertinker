@@ -84,10 +84,12 @@ interface RunStatus {
   mtimeMs: number; isCurrent: boolean
 }
 
-// A run is only truly "running" if its log has been touched recently.
-// Processes killed externally leave behind logs with a last START/INVOKE
-// but no DONE/FAILED — they'd stay "running" forever without this check.
-const STALE_MS = 120_000   // 2 minutes of log inactivity → stale
+// Running runs go "stale" if the log hasn't been touched in a short window
+// (killed processes leave logs frozen mid-INVOKE). Paused runs have a much
+// longer window because pausing is intentional and durable — but we still
+// don't want week-old paused runs polluting the footer.
+const STALE_RUNNING_MS = Number(process.env.CHAT_STALE_RUNNING_MS ?? 120_000)     // 2 min
+const STALE_PAUSED_MS  = Number(process.env.CHAT_STALE_PAUSED_MS  ?? 86_400_000)  // 24 h
 
 function classifyRun(runDir: string, runId: string, currentRunId: string): RunStatus | null {
   try {
@@ -111,7 +113,7 @@ function classifyRun(runDir: string, runId: string, currentRunId: string): RunSt
       const m = lines[i].match(/\]\s+(?:START|RESUME|INVOKE)\s+(\S+)/)
       if (m) { currentNode = m[1]; break }
     }
-    const status: RunStatus["status"] = (Date.now() - logMtime < STALE_MS) ? "running" : "stale"
+    const status: RunStatus["status"] = (Date.now() - logMtime < STALE_RUNNING_MS) ? "running" : "stale"
     return { runId, currentNode, status, mtimeMs: logMtime, isCurrent: runId === currentRunId }
   } catch { return null }
 }
@@ -126,10 +128,17 @@ function scanActiveRuns(currentRunId: string): RunStatus[] {
       if (s) entries.push(s)
     }
   } catch { return [] }
-  // Keep only actionable runs: the current chat run plus anything paused or
-  // genuinely running. Stale/done/failed are hidden — they clutter the footer
-  // and aren't something the user can do anything about from here.
-  const active = entries.filter(e => e.isCurrent || e.status === "paused" || e.status === "running")
+  // Keep only actionable runs: the current chat run plus anything recently
+  // active — running (log touched < 2 min) or recently paused (< 24 h).
+  // Old paused runs are hidden to keep the footer useful; they're still on
+  // disk and can be resumed by explicit --run <id>.
+  const now = Date.now()
+  const active = entries.filter(e => {
+    if (e.isCurrent) return true
+    if (e.status === "running") return true   // classifier already applied the stale window
+    if (e.status === "paused")  return (now - e.mtimeMs) < STALE_PAUSED_MS
+    return false
+  })
   active.sort((a, b) => {
     if (a.isCurrent && !b.isCurrent) return -1
     if (!a.isCurrent && b.isCurrent) return 1
