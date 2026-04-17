@@ -215,7 +215,7 @@ export async function invoke(ctx: ProviderContext): Promise<AgentResult> {
     const streamed = await runStreaming("claude", args, ctx.cwd, ctx.logFile, ctx.onChunk!, ctx.signal)
     result = {
       output:   streamed.output,
-      choice:   ctx.options[0] ?? "",
+      choice:   ctx.options[0] ?? "ok",
       metadata: { sessionId: streamed.sessionId ?? sessionId, streaming: true },
     }
     if (streamed.sessionId) writeSession(ctx.logFile, streamed.sessionId)
