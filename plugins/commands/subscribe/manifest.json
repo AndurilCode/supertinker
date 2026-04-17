@@ -1,0 +1,7 @@
+{
+  "name": "subscribe",
+  "type": "command",
+  "description": "Tail an event source and resume or spawn workflow runs per event",
+  "files": ["subscribe.ts"],
+  "version": "1.0.0"
+}

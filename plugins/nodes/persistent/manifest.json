@@ -1,0 +1,7 @@
+{
+  "name": "persistent",
+  "type": "node",
+  "description": "Agent that runs, stores output, then pauses awaiting an external event — loops on resume",
+  "files": ["persistent.ts"],
+  "version": "1.0.0"
+}

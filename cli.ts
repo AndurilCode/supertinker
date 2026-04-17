@@ -613,7 +613,10 @@ const runCmd: CommandPlugin = {
 
     if (quiet) {
       await run({ workflow, initialContext, overrides })
-      return
+      // Force exit — hooks and other plugins may hold the event loop alive
+      // (e.g. detached child processes, lingering timers). Once the workflow
+      // has reached a terminal/paused state there is no more CLI work to do.
+      process.exit(0)
     }
 
     // Dashboard mode: suppress stdout writes and prevent child processes
@@ -662,7 +665,7 @@ const resumeCmd: CommandPlugin = {
 
     if (quiet) {
       await resume({ workflow, runId, choice, overrides })
-      return
+      process.exit(0)
     }
 
     process.stdout.write = (() => true) as any
