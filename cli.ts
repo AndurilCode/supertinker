@@ -548,19 +548,20 @@ async function loadMapperForProvider(provider: string): Promise<TranscriptMapper
   return null
 }
 
-// ─── CLI
+// ─── BUILT-IN COMMANDS (exposed through the same CommandPlugin contract as
+// external command plugins, but bundled with the CLI so they are always
+// available without installation).
 
-async function cli(): Promise<void> {
-  const argv = process.argv.slice(2)
-  const cmd  = argv[0]
-  const get  = (flag: string) => { const i = argv.indexOf(flag); return i >= 0 ? argv[i + 1] : undefined }
-
-  if (cmd === "run") {
+const runCmd: CommandPlugin = {
+  name: "run",
+  description: "run a workflow",
+  usage: "run [--workflow <name|path>] --prompt <text> [--quiet]   (default: meta)",
+  async handler(args, get) {
     const workflowRef  = get("--workflow") ?? "meta"
     const prompt       = get("--prompt")
     const provider     = get("--provider")
     const model        = get("--model")
-    const quiet        = argv.includes("--quiet")
+    const quiet        = args.includes("--quiet")
     const overrides: ProviderOverrides = { ...(provider && { provider }), ...(model && { model }) }
     const storage = await loadStorage()
     const workflowPath = await storage.resolveWorkflow(workflowRef) ?? resolve(workflowRef)
@@ -602,13 +603,17 @@ async function cli(): Promise<void> {
       runWorkflow: () => workflowPromise,
       loadMapper: loadMapperForProvider,
     })
-    return
-  }
+  },
+}
 
-  if (cmd === "resume") {
+const resumeCmd: CommandPlugin = {
+  name: "resume",
+  description: "resume a paused run",
+  usage: "resume --run <runId> --choice <label> --workflow <name|path> [--quiet]",
+  async handler(args, get) {
     const runId = get("--run"), choice = get("--choice"), workflowRef = get("--workflow")
     const provider = get("--provider"), model = get("--model")
-    const quiet = argv.includes("--quiet")
+    const quiet = args.includes("--quiet")
     const overrides: ProviderOverrides = { ...(provider && { provider }), ...(model && { model }) }
     if (!runId || !choice || !workflowRef) { console.error("Usage: supertinker resume --run <id> --choice <label> --workflow <name|path>"); process.exit(1) }
     const storage = await loadStorage()
@@ -627,10 +632,14 @@ async function cli(): Promise<void> {
       runWorkflow: () => resume({ workflow, runId, choice, overrides }),
       loadMapper: loadMapperForProvider,
     })
-    return
-  }
+  },
+}
 
-  if (cmd === "status") {
+const statusCmd: CommandPlugin = {
+  name: "status",
+  description: "inspect a run's state and context",
+  usage: "status --run <runId>",
+  async handler(args, get) {
     const runId = get("--run")
     if (!runId) { console.error("Usage: supertinker status --run <runId>"); process.exit(1) }
     const storage = await loadStorage()
@@ -796,12 +805,15 @@ async function cli(): Promise<void> {
       for (const line of tail) console.log(`    ${line}`)
       console.log()
     }
-    return
-  }
+  },
+}
 
-  if (cmd === "list") {
-    const flag = argv[1]
-    if (flag === "--hooks") {
+const listCmd: CommandPlugin = {
+  name: "list",
+  description: "show available workflows (or hooks with --hooks)",
+  usage: "list [--hooks]",
+  async handler(args) {
+    if (args.includes("--hooks")) {
       const tmpDir = join("/tmp/orchestrator", "hook-list")
       mkdirSync(tmpDir, { recursive: true })
       const hooks = await loadHooks(tmpDir)
@@ -819,30 +831,39 @@ async function cli(): Promise<void> {
     }
     const storage = await loadStorage()
     console.log(await buildCatalog(storage))
-    return
-  }
+  },
+}
 
-  if (cmd === "plugins") {
-    const sub = argv[1]
+const pluginsCmd: CommandPlugin = {
+  name: "plugins",
+  description: "manage plugins (hooks, providers, workflows, storage, commands)",
+  usage: `plugins <list|install|uninstall|update>
+
+  list [--installed]                show available/installed plugins
+  install [<name>...] [--global|--local]   install plugins
+  uninstall <name>... --global|--local     remove plugins
+  update                            pull latest + re-copy installed`,
+  async handler(args) {
+    const sub = args[0]
     if (sub === "list") {
-      pluginsList(argv.includes("--installed"))
+      pluginsList(args.includes("--installed"))
       return
     }
     if (sub === "install") {
-      const names = argv.slice(2).filter(a => !a.startsWith("--"))
+      const names = args.slice(1).filter(a => !a.startsWith("--"))
       let scope: "global" | "local" | undefined
-      if (argv.includes("--global")) scope = "global"
-      if (argv.includes("--local")) scope = "local"
+      if (args.includes("--global")) scope = "global"
+      if (args.includes("--local")) scope = "local"
       if (!scope) scope = await ansiScopePicker()
       await installPlugins(names, scope)
       return
     }
     if (sub === "uninstall") {
-      const names = argv.slice(2).filter(a => !a.startsWith("--"))
+      const names = args.slice(1).filter(a => !a.startsWith("--"))
       if (names.length === 0) { console.error("Usage: supertinker plugins uninstall <name> [<name>...] --global|--local"); process.exit(1) }
       let scope: "global" | "local" | undefined
-      if (argv.includes("--global")) scope = "global"
-      if (argv.includes("--local")) scope = "local"
+      if (args.includes("--global")) scope = "global"
+      if (args.includes("--local")) scope = "local"
       if (!scope) { console.error("Specify --global or --local"); process.exit(1) }
       uninstallPlugins(names, scope)
       return
@@ -852,10 +873,33 @@ async function cli(): Promise<void> {
       return
     }
     console.log("Usage: supertinker plugins <list|install|uninstall|update>")
+  },
+}
+
+const BUILTIN_COMMANDS: CommandPlugin[] = [runCmd, resumeCmd, statusCmd, listCmd, pluginsCmd]
+
+function renderCommandEntry(c: { name: string; description: string; usage?: string }): string {
+  const head = `  ${c.name.padEnd(10)}${c.description}`
+  if (!c.usage) return head
+  const usageLines = c.usage.split("\n").map(l => `    ${l}`).join("\n")
+  return `${head}\n    Usage:\n${usageLines}`
+}
+
+// ─── CLI
+
+async function cli(): Promise<void> {
+  const argv = process.argv.slice(2)
+  const cmd  = argv[0]
+  const get  = (flag: string) => { const i = argv.indexOf(flag); return i >= 0 ? argv[i + 1] : undefined }
+
+  // Built-in commands share the CommandPlugin contract with external plugins.
+  const builtin = BUILTIN_COMMANDS.find(c => c.name === cmd)
+  if (builtin) {
+    await builtin.handler(argv.slice(1), get)
     return
   }
 
-  // ── Command plugins: try to dispatch to an installed command plugin
+  // Fall through to installed command plugins.
   if (cmd && cmd !== "--help" && cmd !== "-h") {
     const loaded = await loadCommandPlugin(cmd)
     if (loaded) {
@@ -864,26 +908,18 @@ async function cli(): Promise<void> {
     }
   }
 
-  // ── Help / no command: print usage with discovered command plugins
-  const commandPlugins = await discoverCommandPlugins()
-  const pluginSection = commandPlugins.length > 0
-    ? "\n\nInstalled command plugins:\n" + commandPlugins.map(p =>
-        `  ${p.name.padEnd(10)}${p.description}${p.usage ? `\n${"".padEnd(12)}Usage: ${p.usage}` : ""}`
-      ).join("\n")
+  // Help / no command: render built-ins and installed command plugins
+  // through the same renderer so they read identically.
+  const pluginCmds = await discoverCommandPlugins()
+  const builtinSection = BUILTIN_COMMANDS.map(renderCommandEntry).join("\n")
+  const pluginSection = pluginCmds.length > 0
+    ? "\n\nInstalled command plugins:\n" + pluginCmds.map(renderCommandEntry).join("\n")
     : ""
 
   console.log(`supertinker — minimal agent orchestrator
 
-Commands:
-  run       [--workflow <name|path>] --prompt <text> [--quiet]   (default: meta)
-  resume    --run <runId> --choice <label> --workflow <name|path> [--quiet]
-  status    --run <runId>   inspect a run's state and context
-  list             show available workflows
-  list --hooks     show discovered hooks
-  plugins list [--installed]          show available/installed plugins
-  plugins install [<name>...] [--global|--local]   install plugins
-  plugins uninstall <name>... --global|--local     remove plugins
-  plugins update                      pull latest + re-copy installed${pluginSection}
+Built-in commands:
+${builtinSection}${pluginSection}
 
 Examples:
   tsx cli.ts run --prompt "Build a REST API"
