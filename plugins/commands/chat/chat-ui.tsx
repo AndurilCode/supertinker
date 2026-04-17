@@ -315,15 +315,15 @@ function Chat({ runId, workflow, choice, contextKey, replyKey, initial }: ChatPr
         ))}
       </Box>
 
-      <Footer runs={runs} />
-
-      <Box marginTop={1}>
+      <Box marginTop={1} marginBottom={1}>
         {thinking ? (
           <Text><Text color="cyan"><Spinner type="dots" /></Text><Text dimColor> thinking…</Text></Text>
         ) : (
           <Text><Text color="cyan" bold>❯ </Text><Text>{input}</Text><Text color="gray">▌</Text></Text>
         )}
       </Box>
+
+      <Footer runs={runs} />
     </Box>
   )
 }
