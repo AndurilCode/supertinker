@@ -1,0 +1,7 @@
+{
+  "name": "script",
+  "type": "node",
+  "description": "Runs a shell command, stores stdout as the node's output, follows options.done",
+  "files": ["script.ts"],
+  "version": "1.0.0"
+}

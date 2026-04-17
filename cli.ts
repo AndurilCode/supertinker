@@ -18,7 +18,7 @@ import { existsSync, mkdirSync, readFileSync, copyFileSync, unlinkSync, writeFil
 import { spawnSync, execSync }                        from "child_process"
 import { join, resolve }                              from "path"
 import { homedir }                                    from "os"
-import { run, resume, buildCatalog, loadStorage, loadHooks } from "./supertinker.js"
+import { run, resume, buildCatalog, buildNodeCatalog, loadStorage, loadHooks } from "./supertinker.js"
 import type { Context, ProviderOverrides }                   from "./supertinker.js"
 import { renderDashboard } from "./dashboard.js"
 import type { TranscriptMapper } from "./display-protocol.js"
@@ -45,7 +45,7 @@ function ensureTmux(): boolean {
 
 interface PluginManifest {
   name: string
-  type: "hook" | "provider" | "workflow" | "storage" | "command"
+  type: "hook" | "provider" | "workflow" | "storage" | "command" | "node"
   description: string
   files: string[]
   version: string
@@ -69,9 +69,9 @@ export interface CommandPlugin {
   handler:     (args: string[], get: (flag: string) => string | undefined) => Promise<void>
 }
 
-const PLUGIN_TYPES = ["hook", "provider", "workflow", "storage", "command"] as const
+const PLUGIN_TYPES = ["hook", "provider", "workflow", "storage", "command", "node"] as const
 const TYPE_TO_DIR: Record<string, string> = {
-  hook: "hooks", provider: "providers", workflow: "workflows", storage: "storage", command: "commands",
+  hook: "hooks", provider: "providers", workflow: "workflows", storage: "storage", command: "commands", node: "nodes",
 }
 
 const USER_HOME = join(homedir(), ".supertinker")
@@ -162,7 +162,7 @@ function pluginsList(onlyInstalled: boolean): void {
   for (const m of available) grouped.get(m.type)!.push(m)
 
   const typeLabels: Record<string, string> = {
-    hook: "Hooks", provider: "Providers", workflow: "Workflows", storage: "Storage", command: "Commands",
+    hook: "Hooks", provider: "Providers", workflow: "Workflows", storage: "Storage", command: "Commands", node: "Node Types",
   }
 
   for (const type of PLUGIN_TYPES) {
@@ -566,7 +566,11 @@ const runCmd: CommandPlugin = {
     const storage = await loadStorage()
     const workflowPath = await storage.resolveWorkflow(workflowRef) ?? resolve(workflowRef)
     const { workflow } = await import(workflowPath)
-    const initialContext: Context = { catalog: await buildCatalog(storage), cwd: process.cwd() }
+    const initialContext: Context = {
+      catalog:     await buildCatalog(storage),
+      nodeCatalog: await buildNodeCatalog(),
+      cwd:         process.cwd(),
+    }
     if (prompt) initialContext.task = prompt
 
     if (quiet) {
