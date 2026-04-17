@@ -31,6 +31,7 @@ export const hook: Hook = {
 | `NodeEnd` | Just before successful flow leaves the node (terminals included; not fired on the error path — see `Error`) | `nodeId`, `nodeType`, `to: string \| null` |
 | `PreAgent` | Before agent invocation (context mutable here) | `nodeId`, `agent`, `provider`, `userPrompt`, `systemPrompt`, `slicedContext` |
 | `PostAgent` | After agent returns | `nodeId`, `result: AgentResult`, `transcriptPath?` |
+| `PartialAgent` | Each streamed chunk during agent invocation (only fires for providers that call `ctx.onChunk`) | `nodeId`, `agent`, `provider`, `chunk: string`, `totalChars` |
 | `PreProvider` | Just before provider.invoke() call | `nodeId`, `provider`, `userPrompt`, `systemPrompt`, `cwd`, `model?`, `logFile` |
 | `Paused` | Run entered paused state | `nodeId`, `reason?`, `stateFile` |
 | `Resumed` | Run resumed from pause | `nodeId`, `choice` |
@@ -53,9 +54,10 @@ Return one of these from `handler`. Unsupported directives for an event silently
 | `{ action: "skip" }` | PreAgent, PreProvider | Skip this node, go to fallback |
 | `{ action: "pause", reason: string }` | PreAgent, PreProvider, PostAgent, GuardrailFail, SubworkflowStart, NodeStart | Pause the run |
 | `{ action: "redirect", targetNodeId: string }` | PreAgent, PreProvider, PostAgent | Jump to a different node |
+| `{ action: "rewrite", patch: object, reason?: string }` | PreAgent, PreProvider, PostAgent | Transform-middleware — mutate payload fields for downstream steps. Only keys in the per-event whitelist are applied; others are dropped with a warning. Multiple rewrites compose. PreAgent/PreProvider: `userPrompt`, `systemPrompt` (PreProvider also `model`, `cwd`). PostAgent: `output`, `choice`, `metadata` |
 | `{ action: "abort", reason: string }` | all | Throw — terminates the run immediately |
 
-**Conflict resolution (when multiple hooks fire):** highest-rank wins (`abort > pause > redirect > skip > continue`). Equal rank: lower `priority` number wins.
+**Conflict resolution (when multiple hooks fire):** highest-rank wins (`abort > pause > redirect > skip > continue`; `rewrite` is non-terminal and composes separately). Equal rank: lower `priority` number wins. If a batch produces rewrites plus a flow-control directive, the flow-control directive wins and the rewrite is discarded.
 
 ## Example: Pause on Keyword in Output
 

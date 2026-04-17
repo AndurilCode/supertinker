@@ -18,10 +18,12 @@ export async function invoke(ctx: ProviderContext): Promise<AgentResult> {
 interface ProviderContext {
   userPrompt:   string    // rendered context + instruction
   systemPrompt: string    // agent system prompt
-  options:      string[]  // list of valid choice labels (from node.options keys)
+  options:      string[]  // list of valid choice labels (from node.options keys; may be empty for free-form callers like persistent nodes)
   cwd:          string    // resolved working directory
   model?:       string    // optional model override
   logFile:      string    // path to write raw stdout (already opened by orchestrator)
+  onChunk?:     (chunk: string) => void   // streaming: call per chunk as text arrives
+  signal?:      AbortSignal                // abort signal — throw/return when signal.aborted
 }
 ```
 
@@ -30,10 +32,15 @@ interface ProviderContext {
 ```typescript
 interface AgentResult {
   output:          string   // the agent's full text response
-  choice:          string   // must match one of ctx.options
+  choice:          string   // must match one of ctx.options (or any non-empty marker if options is empty)
   transcriptPath?: string   // optional path to a saved transcript
+  metadata?:       Record<string, unknown>  // optional provider-specific metadata (sessionId, streaming flag, etc.)
 }
 ```
+
+## Streaming (optional)
+
+If `ctx.onChunk` is defined, the caller opted into streaming. Forward each incremental text chunk via `ctx.onChunk(chunk)` — the orchestrator fans it out to `PartialAgent` hooks. Check `ctx.signal?.aborted` between chunks and exit promptly if set (a hook may have requested `abort`). Streaming calls typically skip strict output schemas since the incremental protocol can't carry structured constraints.
 
 ## Sentinel Block Convention
 
