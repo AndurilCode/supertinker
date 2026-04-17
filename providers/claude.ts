@@ -41,26 +41,68 @@ function writeSession(logFile: string, sessionId: string): void {
   writeFileSync(sessionPathFor(logFile), sessionId)
 }
 
+// ─── Child-process lifecycle ────────────────────────────────────────────────
+// Track every live Claude subprocess so we can guarantee it's dead when the
+// orchestrator exits. Without this, `cli.ts` calls `process.exit(0)` after a
+// --quiet run completes, which abandons any still-running `claude` child to
+// init — it keeps burning tokens until it finishes on its own.
+//
+// On abort (AbortSignal or parent exit) we SIGTERM first, then SIGKILL after
+// a short grace period. `spawn` is called without `detached:true`/`unref()`
+// so the child stays in our process group and `process.on("exit")` can reach
+// it synchronously.
+
+const liveChildren = new Set<ChildProcess>()
+let exitHookInstalled = false
+function installExitHook(): void {
+  if (exitHookInstalled) return
+  exitHookInstalled = true
+  const killAll = () => {
+    for (const p of liveChildren) { try { p.kill("SIGKILL") } catch {} }
+  }
+  // 'exit' is the only place we're guaranteed synchronous cleanup before
+  // Node tears down. Signals arrive before exit, so handle them too — we
+  // re-raise after cleanup so the default termination behavior still runs.
+  process.on("exit", killAll)
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    process.on(sig, () => { killAll(); process.exit(128) })
+  }
+}
+
+function trackChild(proc: ChildProcess): void {
+  installExitHook()
+  liveChildren.add(proc)
+  proc.once("close", () => liveChildren.delete(proc))
+}
+
+function killWithEscalation(proc: ChildProcess): void {
+  try { proc.kill("SIGTERM") } catch {}
+  // If SIGTERM is ignored, escalate after 2s. Clear timer if the child exits
+  // on its own so we don't leak a timer handle.
+  const esc = setTimeout(() => { try { proc.kill("SIGKILL") } catch {} }, 2000)
+  proc.once("close", () => clearTimeout(esc))
+}
+
 // ─── Blocking (non-streaming) execution ─────────────────────────────────────
 
 function runBlocking(command: string, args: string[], cwd: string, logFile: string, signal?: AbortSignal): Promise<string> {
   return new Promise((res, rej) => {
-    const proc = spawn(command, args, { cwd, env: process.env, detached: true, stdio: ["pipe", "pipe", "pipe"] })
-    proc.unref()
+    const proc = spawn(command, args, { cwd, env: process.env, stdio: ["pipe", "pipe", "pipe"] })
+    trackChild(proc)
     let out = "", err = ""
-    const onAbort = () => { try { proc.kill("SIGTERM") } catch {} }
+    const onAbort = () => killWithEscalation(proc)
     signal?.addEventListener("abort", onAbort, { once: true })
-    proc.stdout.on("data", (chunk: Buffer) => {
+    proc.stdout!.on("data", (chunk: Buffer) => {
       const txt = chunk.toString(); out += txt
       appendFileSync(logFile, txt)
     })
-    proc.stderr.on("data", (chunk: Buffer) => { err += chunk.toString() })
+    proc.stderr!.on("data", (chunk: Buffer) => { err += chunk.toString() })
     proc.on("close", code => {
       signal?.removeEventListener("abort", onAbort)
       if (signal?.aborted) return rej(new Error(`Aborted: ${(signal as any).reason?.message ?? "signal"}`))
       code === 0 ? res(out) : rej(new Error(`exit ${code}: ${err.slice(0, 300)}`))
     })
-    proc.stdin.end()
+    proc.stdin!.end()
   })
 }
 
@@ -78,15 +120,15 @@ function runStreaming(
   onChunk: (chunk: string) => void, signal?: AbortSignal,
 ): Promise<StreamedResult> {
   return new Promise((res, rej) => {
-    const proc: ChildProcess = spawn(command, args, { cwd, env: process.env, detached: true, stdio: ["pipe", "pipe", "pipe"] })
-    proc.unref()
+    const proc: ChildProcess = spawn(command, args, { cwd, env: process.env, stdio: ["pipe", "pipe", "pipe"] })
+    trackChild(proc)
 
     let buf = "", err = ""
     let accumulated = ""
     let finalResult: string | undefined
     let sessionId:   string | undefined
 
-    const onAbort = () => { try { proc.kill("SIGTERM") } catch {} }
+    const onAbort = () => killWithEscalation(proc)
     signal?.addEventListener("abort", onAbort, { once: true })
 
     const handleLine = (line: string) => {

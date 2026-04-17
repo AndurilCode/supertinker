@@ -244,7 +244,9 @@ function Chat({ runId, workflow, choice, contextKey, replyKey, initial }: ChatPr
   // this session" (current run + child workflows the director launched).
   // A hair of slack (1 minute earlier) covers the current run's own pause
   // which may have been written just before chat was opened.
-  const sessionStartMs = Math.floor(Date.now() - 60_000)
+  // Stored in state with a lazy initializer so it's computed once and doesn't
+  // change on every re-render (which would otherwise churn the poll useEffect).
+  const [sessionStartMs] = useState(() => Date.now() - 60_000)
 
   const [messages, setMessages] = useState<Msg[]>(
     initial ? [{ role: "agent", text: initial }] : [],
