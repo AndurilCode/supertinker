@@ -94,26 +94,49 @@ const STALE_PAUSED_MS  = Number(process.env.CHAT_STALE_PAUSED_MS  ?? 86_400_000)
 function classifyRun(runDir: string, runId: string, currentRunId: string): RunStatus | null {
   try {
     const mtimeMs = statSync(runDir).mtimeMs
-    if (existsSync(join(runDir, "state.json"))) {
+    const logPath = join(runDir, "orchestrator.log")
+    const statePath = join(runDir, "state.json")
+    const hasState = existsSync(statePath)
+    const hasLog   = existsSync(logPath)
+
+    // During a resume, state.json is still on disk (points to the paused-at
+    // node) but the log is actively being written. Treat a state+log pair
+    // where log.mtime > state.mtime AND log is very fresh as "running".
+    const logMtime   = hasLog   ? statSync(logPath).mtimeMs   : 0
+    const stateMtime = hasState ? statSync(statePath).mtimeMs : 0
+    const logIsHot   = hasLog && (Date.now() - logMtime) < STALE_RUNNING_MS
+
+    if (hasState && logMtime > stateMtime + 50 && logIsHot) {
+      // In-flight resume — parse log for current node
+      const log = readFileSync(logPath, "utf8")
+      const lines = log.trim().split(/\r?\n/)
+      let currentNode = "?"
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const m = lines[i].match(/\]\s+(?:START|RESUME|INVOKE)\s+(\S+)/)
+        if (m) { currentNode = m[1]; break }
+      }
+      return { runId, currentNode, status: "running", mtimeMs: logMtime, isCurrent: runId === currentRunId }
+    }
+
+    if (hasState) {
       try {
-        const s = JSON.parse(readFileSync(join(runDir, "state.json"), "utf8"))
-        return { runId, currentNode: s.nodeId ?? "?", status: "paused", mtimeMs, isCurrent: runId === currentRunId }
+        const s = JSON.parse(readFileSync(statePath, "utf8"))
+        return { runId, currentNode: s.nodeId ?? "?", status: "paused", mtimeMs: stateMtime, isCurrent: runId === currentRunId }
       } catch {}
     }
-    const logPath = join(runDir, "orchestrator.log")
-    if (!existsSync(logPath)) return null
+
+    if (!hasLog) return null
     const log = readFileSync(logPath, "utf8")
     if (/^\[[^\]]+\]\s+DONE\s+graph/m.test(log))   return { runId, currentNode: "done",   status: "done",   mtimeMs, isCurrent: runId === currentRunId }
     if (/^\[[^\]]+\]\s+FAILED\s+graph/m.test(log)) return { runId, currentNode: "failed", status: "failed", mtimeMs, isCurrent: runId === currentRunId }
 
-    const logMtime = statSync(logPath).mtimeMs
     const lines = log.trim().split(/\r?\n/)
     let currentNode = "?"
     for (let i = lines.length - 1; i >= 0; i--) {
       const m = lines[i].match(/\]\s+(?:START|RESUME|INVOKE)\s+(\S+)/)
       if (m) { currentNode = m[1]; break }
     }
-    const status: RunStatus["status"] = (Date.now() - logMtime < STALE_RUNNING_MS) ? "running" : "stale"
+    const status: RunStatus["status"] = logIsHot ? "running" : "stale"
     return { runId, currentNode, status, mtimeMs: logMtime, isCurrent: runId === currentRunId }
   } catch { return null }
 }
@@ -230,9 +253,10 @@ function Chat({ runId, workflow, choice, contextKey, replyKey, initial }: ChatPr
   const [thinking, setThinking] = useState(false)
   const [runs, setRuns]         = useState<RunStatus[]>(() => scanActiveRuns(runId, sessionStartMs))
 
-  // Refresh active runs every 2s
+  // Refresh active runs every 1s so status flips (paused → running → paused)
+  // during a resume are visible while the user waits for a reply.
   useEffect(() => {
-    const t = setInterval(() => setRuns(scanActiveRuns(runId, sessionStartMs)), 2000)
+    const t = setInterval(() => setRuns(scanActiveRuns(runId, sessionStartMs)), 1000)
     return () => clearInterval(t)
   }, [runId, sessionStartMs])
 
@@ -328,16 +352,133 @@ function Chat({ runId, workflow, choice, contextKey, replyKey, initial }: ChatPr
   )
 }
 
-// ─── Public entrypoint ────────────────────────────────────────────────────
-export interface MountOpts {
-  runId:      string
+// ─── Bootstrap helpers (fresh run / attach) ───────────────────────────────
+async function waitForPause(runDir: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (existsSync(join(runDir, "state.json"))) return true
+    await new Promise(r => setTimeout(r, 300))
+  }
+  return false
+}
+async function startFreshRun(workflow: string, timeoutMs: number): Promise<string | null> {
+  const sinceMs = Date.now()
+  const self = process.argv[1] ?? "/Users/gpavanello/Repositories/supertinker/cli.ts"
+  spawn(
+    process.execPath,
+    [self, "run", "--workflow", workflow, "--quiet"],
+    { stdio: "ignore", env: { ...process.env, TMUX: "1" }, detached: true },
+  ).unref()
+
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      const matches = readdirSync(RUN_ROOT)
+        .filter(n => n.startsWith(`${workflow}-`))
+        .map(n => ({ n, m: statSync(join(RUN_ROOT, n)).mtimeMs }))
+        .filter(e => e.m >= sinceMs)
+        .sort((a, b) => b.m - a.m)
+      if (matches.length > 0 && existsSync(join(RUN_ROOT, matches[0].n, "state.json"))) {
+        return matches[0].n
+      }
+    } catch {}
+    await new Promise(r => setTimeout(r, 300))
+  }
+  return null
+}
+
+// ─── Boot-then-Chat wrapper ───────────────────────────────────────────────
+interface AppProps {
+  runId?:     string
   workflow:   string
   choice:     string
   contextKey: string
   replyKey:   string
-  initial?:   string
+}
+
+function Header({ workflow, runId }: { workflow: string; runId?: string }) {
+  return (
+    <Box borderStyle="round" borderColor="cyan" paddingX={1} marginBottom={1}>
+      <Text color="cyan" bold>supertinker</Text>
+      <Text dimColor>  ·  </Text>
+      <Text color="yellow">{workflow}</Text>
+      {runId && (<><Text dimColor>  ·  </Text><Text dimColor>{runId}</Text></>)}
+    </Box>
+  )
+}
+
+function App({ runId: initialRunId, workflow, choice, contextKey, replyKey }: AppProps) {
+  const [runId, setRunId]     = useState<string | undefined>(initialRunId)
+  const [initial, setInitial] = useState<string | undefined>(undefined)
+  const [error, setError]     = useState<string | undefined>(undefined)
+
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        let id = initialRunId
+        if (!id) {
+          const spawned = await startFreshRun(workflow, 60_000)
+          if (!spawned) { setError(`run did not pause within 60s — check hooks / workflow definition`); return }
+          id = spawned
+        }
+        const runDir = join(RUN_ROOT, id)
+        if (!existsSync(join(runDir, "state.json"))) {
+          if (!await waitForPause(runDir, 30_000)) {
+            setError(`${id} is not paused (no state.json) — nothing to resume`); return
+          }
+        }
+        let firstReply: string | undefined
+        try {
+          const state = JSON.parse(readFileSync(join(runDir, "state.json"), "utf8"))
+          firstReply = state?.context?.[replyKey]
+        } catch {}
+        if (cancelled) return
+        setInitial(firstReply)
+        setRunId(id)
+      } catch (err) {
+        if (!cancelled) setError(String(err))
+      }
+    })()
+    return () => { cancelled = true }
+  }, [initialRunId, workflow, replyKey])
+
+  if (error) {
+    return (
+      <Box flexDirection="column">
+        <Header workflow={workflow} />
+        <Text color="red">error: {error}</Text>
+      </Box>
+    )
+  }
+  if (!runId) {
+    return (
+      <Box flexDirection="column">
+        <Header workflow={workflow} />
+        <Box>
+          <Text color="cyan"><Spinner type="dots" /></Text>
+          <Text dimColor>  starting {workflow} …</Text>
+        </Box>
+      </Box>
+    )
+  }
+  return (
+    <Box flexDirection="column">
+      <Header workflow={workflow} runId={runId} />
+      <Chat runId={runId} workflow={workflow} choice={choice} contextKey={contextKey} replyKey={replyKey} initial={initial} />
+    </Box>
+  )
+}
+
+// ─── Public entrypoint ────────────────────────────────────────────────────
+export interface MountOpts {
+  runId?:     string
+  workflow:   string
+  choice:     string
+  contextKey: string
+  replyKey:   string
 }
 
 export function mountChat(opts: MountOpts): void {
-  render(<Chat {...opts} />)
+  render(<App {...opts} />)
 }
