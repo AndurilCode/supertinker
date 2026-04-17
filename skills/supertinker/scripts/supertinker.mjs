@@ -31,6 +31,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  statSync,
   writeFileSync
 } from "fs";
 import { join, resolve } from "path";
@@ -40,11 +41,37 @@ var BUILTIN_DIR = resolve(join(new URL(import.meta.url).pathname, ".."));
 var USER_DIR = join(homedir(), ".supertinker");
 var PROJECT_DIR = join(process.cwd(), ".supertinker");
 var SEARCH_DIRS = [PROJECT_DIR, USER_DIR, BUILTIN_DIR];
+var RUN_ROOT = "/tmp/orchestrator";
 var filesystemStorage = {
   async createRun(runId) {
-    const dir = join("/tmp/orchestrator", runId);
+    const dir = join(RUN_ROOT, runId);
     mkdirSync(dir, { recursive: true });
     return dir;
+  },
+  runDir(runId) {
+    const direct = join(RUN_ROOT, runId);
+    if (existsSync(direct))
+      return direct;
+    if (runId.includes("/")) {
+      const [head, ...rest] = runId.split("/");
+      const subPath = join(RUN_ROOT, head, `sub-${rest.join("/")}`);
+      if (existsSync(subPath))
+        return subPath;
+    }
+    return direct;
+  },
+  async listRuns({ sinceMs = 0 } = {}) {
+    if (!existsSync(RUN_ROOT))
+      return [];
+    const out = [];
+    for (const name of readdirSync(RUN_ROOT)) {
+      try {
+        const s = statSync(join(RUN_ROOT, name));
+        if (s.isDirectory() && s.mtimeMs >= sinceMs)
+          out.push({ runId: name, mtimeMs: s.mtimeMs });
+      } catch {}
+    }
+    return out;
   },
   async saveContext(runDir, context) {
     writeFileSync(join(runDir, "context.json"), JSON.stringify(context, null, 2));
@@ -71,6 +98,10 @@ var filesystemStorage = {
   async saveFile(runDir, name, content) {
     writeFileSync(join(runDir, name), content);
   },
+  async readFile(runDir, name) {
+    const path = join(runDir, name);
+    return existsSync(path) ? readFileSync(path, "utf8") : null;
+  },
   async saveWorkflow(id, content) {
     const dir = join(USER_DIR, "workflows");
     mkdirSync(dir, { recursive: true });
@@ -87,30 +118,66 @@ var filesystemStorage = {
   },
   async listWorkflows() {
     const entries = [];
-    const sources = [
-      [join(PROJECT_DIR, "workflows"), "project"],
-      [join(USER_DIR, "workflows"), "library"],
-      [join(BUILTIN_DIR, "workflows"), "built-in"]
-    ];
-    for (const [dir, source] of sources) {
-      let files;
+    for (const { path, file, source } of walkPluginFiles("workflows", [".workflow.ts"])) {
       try {
-        files = readdirSync(dir).filter((f) => f.endsWith(".workflow.ts"));
-      } catch {
-        continue;
-      }
-      for (const file of files) {
-        try {
-          const raw = readFileSync(join(dir, file), "utf8");
-          const id = raw.match(/(?:"id"|id)\s*:\s*"([^"]+)"/)?.[1] ?? file;
-          const description = raw.match(/(?:"description"|description)\s*:\s*"([^"]+)"/)?.[1] ?? "(no description)";
-          entries.push({ id, description, file, source });
-        } catch {}
-      }
+        const raw = readFileSync(path, "utf8");
+        const id = raw.match(/(?:"id"|id)\s*:\s*"([^"]+)"/)?.[1] ?? file;
+        const description = raw.match(/(?:"description"|description)\s*:\s*"([^"]+)"/)?.[1] ?? "(no description)";
+        entries.push({ id, description, file, source });
+      } catch {}
     }
     return entries;
   }
 };
+function* walkPluginFiles(subdir, exts) {
+  const sources = [
+    [PROJECT_DIR, "project"],
+    [USER_DIR, "user"],
+    [BUILTIN_DIR, "built-in"]
+  ];
+  for (const [base, source] of sources) {
+    const dir = join(base, subdir);
+    if (!existsSync(dir))
+      continue;
+    let files;
+    try {
+      files = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      if (!exts.some((e) => file.endsWith(e)))
+        continue;
+      yield { path: join(dir, file), file, source };
+    }
+  }
+}
+var BUILTIN_HOOK_EVENTS = [
+  "RunStart",
+  "RunEnd",
+  "NodeStart",
+  "NodeEnd",
+  "PreAgent",
+  "PostAgent",
+  "PartialAgent",
+  "PreProvider",
+  "Paused",
+  "Resumed",
+  "ForkStart",
+  "ForkJoin",
+  "GuardrailFail",
+  "SubworkflowStart",
+  "SubworkflowEnd",
+  "Error"
+];
+var BUILTIN_NODE_TYPES = new Set([
+  "fork",
+  "join",
+  "done",
+  "failed",
+  "paused",
+  "subworkflow"
+]);
 function sliceContext(ctx, keys) {
   if (!keys)
     return ctx;
@@ -180,37 +247,59 @@ async function loadStorage() {
     return filesystemStorage;
   return { ...filesystemStorage, ...adapter };
 }
-var VALID_EVENTS = new Set([
-  "RunStart",
-  "RunEnd",
-  "PreAgent",
-  "PostAgent",
-  "PreProvider",
-  "Paused",
-  "Resumed",
-  "ForkStart",
-  "ForkJoin",
-  "GuardrailFail",
-  "SubworkflowStart",
-  "SubworkflowEnd",
-  "Error"
-]);
+async function readNodeTypePlugins() {
+  const out = [];
+  for (const { path, file, source } of walkPluginFiles("nodes", [".ts", ".js"])) {
+    try {
+      const mod = await import(path);
+      const def = mod.node ?? mod.default?.node;
+      if (!def || typeof def.execute !== "function" || !def.type)
+        continue;
+      out.push({ def, source, file });
+    } catch {}
+  }
+  return out;
+}
+async function loadNodeTypes(runDir) {
+  const registry = new Map;
+  const loaded = [];
+  for (const { def, file } of await readNodeTypePlugins()) {
+    if (BUILTIN_NODE_TYPES.has(def.type)) {
+      bootstrapLog(runDir, "node-types", `WARN: skipping ${file} — node type "${def.type}" shadows a built-in`);
+      continue;
+    }
+    if (registry.has(def.type))
+      continue;
+    registry.set(def.type, def);
+    loaded.push(def.type);
+  }
+  bootstrapLog(runDir, "node-types", loaded.length > 0 ? `loaded: ${loaded.join(", ")}` : "no custom node types found");
+  return registry;
+}
+var VALID_EVENTS = new Set(BUILTIN_HOOK_EVENTS);
 var DIRECTIVE_RANK = {
   abort: 5,
   pause: 4,
   redirect: 3,
   skip: 2,
-  continue: 1
+  continue: 1,
+  rewrite: 0
 };
 var DIRECTIVE_SUPPORT = {
   abort: new Set(VALID_EVENTS),
-  pause: new Set(["PreAgent", "PreProvider", "PostAgent", "GuardrailFail", "SubworkflowStart"]),
+  pause: new Set(["PreAgent", "PreProvider", "PostAgent", "GuardrailFail", "SubworkflowStart", "NodeStart"]),
   redirect: new Set(["PreAgent", "PreProvider", "PostAgent"]),
   skip: new Set(["PreAgent", "PreProvider"]),
-  continue: new Set(VALID_EVENTS)
+  continue: new Set(VALID_EVENTS),
+  rewrite: new Set(["PreAgent", "PreProvider", "PostAgent"])
 };
-function bootstrapLog(runDir, msg) {
-  const line = `[${new Date().toISOString().slice(11, 19)}] BOOT    ${"hooks".padEnd(22)} ${msg}`;
+var REWRITE_ALLOWED = {
+  PreAgent: new Set(["userPrompt", "systemPrompt"]),
+  PreProvider: new Set(["userPrompt", "systemPrompt", "model", "cwd"]),
+  PostAgent: new Set(["output", "choice", "metadata"])
+};
+function bootstrapLog(runDir, label, msg) {
+  const line = `[${new Date().toISOString().slice(11, 19)}] BOOT    ${label.padEnd(22)} ${msg}`;
   appendFileSync(join(runDir, "orchestrator.log"), line + `
 `);
   process.stdout.write(line + `
@@ -220,50 +309,38 @@ async function loadHooks(runDir) {
   const index = new Map;
   for (const name of VALID_EVENTS)
     index.set(name, []);
-  const dirs = SEARCH_DIRS.map((d) => join(d, "hooks"));
   const loaded = [];
-  for (const dir of dirs) {
-    if (!existsSync(dir))
-      continue;
-    const files = readdirSync(dir).filter((f) => f.endsWith(".ts") || f.endsWith(".js"));
-    for (const file of files) {
-      const path = join(dir, file);
-      try {
-        const mod = await import(path);
-        const h = mod.hook ?? mod.default?.hook;
-        if (!h || typeof h.handler !== "function" || !h.name || !Array.isArray(h.events) || h.events.length === 0) {
-          bootstrapLog(runDir, `WARN: skipping ${file} — invalid hook export`);
-          continue;
-        }
-        const hook = {
-          name: h.name,
-          description: h.description,
-          events: h.events.filter((e) => VALID_EVENTS.has(e)),
-          parallel: h.parallel ?? true,
-          priority: h.priority ?? 50,
-          timeout: h.timeout ?? 30000,
-          handler: h.handler
-        };
-        if (hook.events.length === 0) {
-          bootstrapLog(runDir, `WARN: skipping ${file} — no valid events`);
-          continue;
-        }
-        for (const evt of hook.events) {
-          index.get(evt).push(hook);
-        }
-        loaded.push(`${hook.name} (${hook.events.join(", ")})`);
-      } catch (err) {
-        bootstrapLog(runDir, `WARN: failed to load ${file}: ${err}`);
+  for (const { path, file } of walkPluginFiles("hooks", [".ts", ".js"])) {
+    try {
+      const mod = await import(path);
+      const h = mod.hook ?? mod.default?.hook;
+      const events = Array.isArray(h?.events) ? h.events.filter((e) => typeof e === "string" && e.length > 0) : [];
+      if (!h || typeof h.handler !== "function" || !h.name || events.length === 0) {
+        bootstrapLog(runDir, "hooks", `WARN: skipping ${file} — invalid hook export`);
+        continue;
       }
+      const hook = {
+        name: h.name,
+        description: h.description,
+        events,
+        parallel: h.parallel ?? true,
+        priority: h.priority ?? 50,
+        timeout: h.timeout ?? 30000,
+        handler: h.handler
+      };
+      for (const evt of hook.events) {
+        if (!index.has(evt))
+          index.set(evt, []);
+        index.get(evt).push(hook);
+      }
+      loaded.push(`${hook.name} (${hook.events.join(", ")})`);
+    } catch (err) {
+      bootstrapLog(runDir, "hooks", `WARN: failed to load ${file}: ${err}`);
     }
   }
-  for (const hooks of index.values()) {
+  for (const hooks of index.values())
     hooks.sort((a, b) => a.priority - b.priority);
-  }
-  if (loaded.length > 0)
-    bootstrapLog(runDir, `loaded: ${loaded.join(", ")}`);
-  else
-    bootstrapLog(runDir, "no hooks found");
+  bootstrapLog(runDir, "hooks", loaded.length > 0 ? `loaded: ${loaded.join(", ")}` : "no hooks found");
   return index;
 }
 async function emitHook(event, payload, state) {
@@ -279,27 +356,56 @@ async function emitHook(event, payload, state) {
     timestamp: Date.now(),
     ...payload
   };
+  const isBuiltinEvent = VALID_EVENTS.has(event);
+  const allowedKeys = REWRITE_ALLOWED[event];
   const directives = [];
-  const runOne = async (hook) => {
+  const cumulativePatch = {};
+  const filterPatch = (hookName, patch) => {
+    if (!allowedKeys) {
+      process.stderr.write(`HOOK-WARN ${hookName}: "rewrite" not supported for ${event}, treating as continue
+`);
+      return {};
+    }
+    const out = {};
+    for (const [k, v] of Object.entries(patch)) {
+      if (allowedKeys.has(k))
+        out[k] = v;
+      else
+        process.stderr.write(`HOOK-WARN ${hookName}: rewrite key "${k}" not allowed for ${event}, dropped
+`);
+    }
+    return out;
+  };
+  const runOne = async (hook, sequential) => {
     try {
       const result = await Promise.race([
         hook.handler(eventObj),
         new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), hook.timeout ?? 30000))
       ]);
       let directive = result;
-      if (result.action !== "continue") {
+      if (result.action === "rewrite") {
+        const supported = DIRECTIVE_SUPPORT.rewrite;
+        if (isBuiltinEvent && !supported?.has(event)) {
+          process.stderr.write(`HOOK-WARN ${hook.name}: "rewrite" not supported for ${event}, treating as continue
+`);
+          directive = { action: "continue" };
+        } else {
+          const filtered = filterPatch(hook.name, result.patch ?? {});
+          Object.assign(cumulativePatch, filtered);
+          if (sequential)
+            Object.assign(eventObj, filtered);
+          directive = { action: "continue" };
+        }
+      } else if (result.action !== "continue") {
         const supported = DIRECTIVE_SUPPORT[result.action];
-        if (!supported?.has(event)) {
+        if (isBuiltinEvent && !supported?.has(event)) {
           process.stderr.write(`HOOK-WARN ${hook.name}: "${result.action}" not supported for ${event}, treating as continue
 `);
           directive = { action: "continue" };
-        } else if (result.action === "redirect") {
-          const rd = result;
-          if (!state.graph.nodes.some((n) => n.id === rd.targetNodeId)) {
-            process.stderr.write(`HOOK-WARN ${hook.name}: redirect target "${rd.targetNodeId}" not found, treating as continue
+        } else if (result.action === "redirect" && !state.graph.nodes.some((n) => n.id === result.targetNodeId)) {
+          process.stderr.write(`HOOK-WARN ${hook.name}: redirect target "${result.targetNodeId}" not found, treating as continue
 `);
-            directive = { action: "continue" };
-          }
+          directive = { action: "continue" };
         }
       }
       directives.push({ directive, priority: hook.priority ?? 50 });
@@ -314,36 +420,123 @@ async function emitHook(event, payload, state) {
       directives.push({ directive: { action: "continue" }, priority: hook.priority ?? 50 });
     }
   };
-  const sequential = hooks.filter((h) => h.parallel === false);
-  for (const hook of sequential)
-    await runOne(hook);
+  for (const hook of hooks)
+    if (hook.parallel === false)
+      await runOne(hook, true);
   const parallel = hooks.filter((h) => h.parallel !== false);
   if (parallel.length > 0)
-    await Promise.all(parallel.map(runOne));
+    await Promise.all(parallel.map((h) => runOne(h, false)));
   let winner = { directive: { action: "continue" }, priority: 100 };
   for (const d of directives) {
     const dRank = DIRECTIVE_RANK[d.directive.action] ?? 1;
     const wRank = DIRECTIVE_RANK[winner.directive.action] ?? 1;
-    if (dRank > wRank || dRank === wRank && d.priority < winner.priority) {
+    if (dRank > wRank || dRank === wRank && d.priority < winner.priority)
       winner = d;
-    }
+  }
+  if (winner.directive.action === "continue" && Object.keys(cumulativePatch).length > 0) {
+    return { action: "rewrite", patch: cumulativePatch };
   }
   return winner.directive;
+}
+function abortIfHook(d) {
+  if (d.action === "abort")
+    throw new Error(`Aborted by hook: ${d.reason}`);
 }
 async function invokeAgent(node, state, precomputed) {
   const def = state.registry[node.agent];
   const command = state.overrides.provider ?? def.command;
-  const model = state.overrides.model ?? def.model;
+  const model = precomputed?.model ?? state.overrides.model ?? def.model;
   const userPrompt = precomputed?.userPrompt ?? renderUserPrompt(sliceContext(state.context, node.slice), node.instruction);
   const sysPrompt = precomputed?.systemPrompt ?? buildSystemPrompt(state.registry, node);
-  const cwd = resolve(state.context[`_worktree:${node.id}`] ?? node.cwd ?? process.cwd());
+  const cwd = resolve(precomputed?.cwd ?? state.context[`_worktree:${node.id}`] ?? node.cwd ?? process.cwd());
   const logFile = state.storage.logPath(state.runDir, node.id);
   const agentTimeout = node.timeout ?? 600000;
   const invoke = await loadProvider(command);
-  const result = await Promise.race([
-    invoke({ userPrompt, systemPrompt: sysPrompt, options: Object.keys(node.options ?? {}), cwd, model, logFile }),
+  return Promise.race([
+    invoke({ userPrompt, systemPrompt: sysPrompt, options: Object.keys(node.options ?? {}), cwd, model, logFile, onChunk: precomputed?.onChunk, signal: precomputed?.signal }),
     new Promise((_, rej) => setTimeout(() => rej(new Error(`Agent timeout after ${agentTimeout}ms on node "${node.id}"`)), agentTimeout))
   ]);
+}
+async function runAgentPipeline(node, state, fromNodeId) {
+  if (!node.agent)
+    throw new Error(`runAgent called without agent on node "${node.id}"`);
+  const sliced = sliceContext(state.context, node.slice);
+  let userPrompt = renderUserPrompt(sliced, node.instruction);
+  let sysPrompt = buildSystemPrompt(state.registry, node);
+  const def = state.registry[node.agent];
+  const command = state.overrides.provider ?? def.command;
+  let model = state.overrides.model ?? def.model;
+  let cwd = resolve(node.cwd ?? process.cwd());
+  const pre = await emitHook("PreAgent", {
+    nodeId: node.id,
+    agent: node.agent,
+    provider: command,
+    userPrompt,
+    systemPrompt: sysPrompt,
+    slicedContext: sliced
+  }, state);
+  if (pre.action === "rewrite") {
+    if (typeof pre.patch.userPrompt === "string")
+      userPrompt = pre.patch.userPrompt;
+    if (typeof pre.patch.systemPrompt === "string")
+      sysPrompt = pre.patch.systemPrompt;
+  } else if (await applyDirective(pre, state, node, fromNodeId))
+    return { redirected: true };
+  const logFile = state.storage.logPath(state.runDir, node.id);
+  const preProv = await emitHook("PreProvider", {
+    nodeId: node.id,
+    agent: node.agent,
+    provider: command,
+    userPrompt,
+    systemPrompt: sysPrompt,
+    cwd,
+    model,
+    logFile
+  }, state);
+  if (preProv.action === "rewrite") {
+    if (typeof preProv.patch.userPrompt === "string")
+      userPrompt = preProv.patch.userPrompt;
+    if (typeof preProv.patch.systemPrompt === "string")
+      sysPrompt = preProv.patch.systemPrompt;
+    if (typeof preProv.patch.model === "string")
+      model = preProv.patch.model;
+    if (typeof preProv.patch.cwd === "string")
+      cwd = preProv.patch.cwd;
+  } else if (await applyDirective(preProv, state, node, fromNodeId))
+    return { redirected: true };
+  const ac = new AbortController;
+  let totalChars = 0;
+  const onChunk = (chunk) => {
+    totalChars += chunk.length;
+    emitHook("PartialAgent", {
+      nodeId: node.id,
+      agent: node.agent,
+      provider: command,
+      chunk,
+      totalChars
+    }, state).then((d) => {
+      if (d.action === "abort")
+        ac.abort(new Error(`Aborted by hook: ${d.reason}`));
+    }).catch(() => {});
+  };
+  const result = await invokeAgent(node, state, { userPrompt, systemPrompt: sysPrompt, model, cwd, onChunk, signal: ac.signal });
+  const post = await emitHook("PostAgent", {
+    nodeId: node.id,
+    agent: node.agent,
+    provider: command,
+    result,
+    transcriptPath: result.transcriptPath
+  }, state);
+  if (post.action === "rewrite") {
+    if (typeof post.patch.output === "string")
+      result.output = post.patch.output;
+    if (typeof post.patch.choice === "string")
+      result.choice = post.patch.choice;
+    if (post.patch.metadata && typeof post.patch.metadata === "object") {
+      result.metadata = { ...result.metadata ?? {}, ...post.patch.metadata };
+    }
+  } else if (await applyDirective(post, state, node, fromNodeId))
+    return { redirected: true };
   return result;
 }
 function evalGuardrail(g, ctx) {
@@ -361,33 +554,30 @@ function evalGuardrail(g, ctx) {
   }
 }
 function runGuardrails(checks, ctx) {
-  for (const check of checks) {
-    const result = evalGuardrail(check, ctx);
+  for (const g of checks) {
+    const result = evalGuardrail(g, ctx);
     if (!result.pass)
-      return result;
+      return result.reason;
   }
-  return { pass: true };
+  return null;
 }
 async function errorFallback(state, nodeId, node, error) {
   const fallback = resolveFallback(node, state.graph);
   await emitHook("Error", { nodeId, error, fallbackNodeId: fallback }, state);
   return executeNode(fallback, nodeId, state);
 }
-async function applyDirective(d, state, nodeId, node, fromNodeId) {
+async function applyDirective(d, state, node, fromNodeId) {
+  if (d.action === "continue")
+    return false;
   if (d.action === "abort")
     throw new Error(`Aborted by hook: ${d.reason}`);
-  if (d.action === "pause") {
-    await writePause(state, nodeId, fromNodeId, d.reason);
-    return true;
-  }
-  if (d.action === "redirect") {
-    await executeNode(d.targetNodeId, nodeId, state);
-    return true;
-  }
-  if (d.action === "skip") {
-    await executeNode(resolveFallback(node, state.graph), nodeId, state);
-    return true;
-  }
+  if (d.action === "pause")
+    await writePause(state, node.id, fromNodeId, d.reason);
+  if (d.action === "redirect")
+    await executeNode(d.targetNodeId, node.id, state);
+  if (d.action === "skip")
+    await executeNode(resolveFallback(node, state.graph), node.id, state);
+  return true;
 }
 async function writePause(state, nodeId, fromNodeId, reason) {
   const paused = {
@@ -400,32 +590,35 @@ async function writePause(state, nodeId, fromNodeId, reason) {
   };
   await state.storage.savePause(state.runDir, paused);
   await saveContext(state);
-  const stateFile = join(state.runDir, "state.json");
-  await emitHook("Paused", { nodeId, reason, stateFile }, state);
+  await emitHook("Paused", { nodeId, reason, stateFile: join(state.runDir, "state.json") }, state);
 }
 async function executeNode(nodeId, fromNodeId, state) {
   const { graph, context, joinMap, runDir } = state;
   const node = graph.nodes.find((n) => n.id === nodeId);
   if (!node)
     throw new Error(`Node not found: "${nodeId}"`);
-  if (node.type === "done") {
-    await emitHook("RunEnd", { terminal: "done", finalContext: context }, state);
+  const nodeType = node.type ?? "standard";
+  const nodeEnd = (to) => emitHook("NodeEnd", { nodeId, nodeType, to }, state);
+  const startDirective = await emitHook("NodeStart", { nodeId, nodeType, from: fromNodeId }, state);
+  abortIfHook(startDirective);
+  if (startDirective.action === "pause") {
+    await writePause(state, nodeId, fromNodeId, startDirective.reason);
     return;
   }
-  if (node.type === "failed") {
-    await emitHook("RunEnd", { terminal: "failed", finalContext: context }, state);
-    throw new Error("Graph reached failed terminal");
-  }
-  if (node.type === "paused") {
-    await writePause(state, nodeId, fromNodeId);
+  if (node.type === "done" || node.type === "failed" || node.type === "paused") {
+    await nodeEnd(null);
+    if (node.type === "paused")
+      return writePause(state, nodeId, fromNodeId);
+    await emitHook("RunEnd", { terminal: node.type, finalContext: context }, state);
+    if (node.type === "failed")
+      throw new Error("Graph reached failed terminal");
     return;
   }
   if (node.type === "fork") {
-    const directive = await emitHook("ForkStart", { nodeId, targets: node.targets }, state);
-    if (directive.action === "abort")
-      throw new Error(`Aborted by hook: ${directive.reason}`);
+    abortIfHook(await emitHook("ForkStart", { nodeId, targets: node.targets }, state));
     await Promise.all(node.targets.map((t) => executeNode(t, nodeId, state)));
     await emitHook("ForkJoin", { nodeId, joinedFrom: node.targets }, state);
+    await nodeEnd(null);
     return;
   }
   if (node.type === "join") {
@@ -434,8 +627,10 @@ async function executeNode(nodeId, fromNodeId, state) {
     const arrived = joinMap.get(nodeId);
     if (fromNodeId)
       arrived.add(fromNodeId);
-    if (arrived.size < node.waits_for.length)
+    if (arrived.size < node.waits_for.length) {
+      await nodeEnd(null);
       return;
+    }
   }
   if (node.type === "subworkflow") {
     const raw = context[node.source];
@@ -465,6 +660,7 @@ export const workflow: Workflow = ${JSON.stringify(inner, null, 2)};
       inner = { ...inner, graph: { ...inner.graph, nodes: inner.graph.nodes.map((n) => !n.cwd && n.agent ? { ...n, cwd } : n) } };
     }
     const innerState = {
+      ...state,
       runId: `${state.runId}/${inner.id}`,
       runDir: innerRunDir,
       context: innerContext,
@@ -476,10 +672,7 @@ export const workflow: Workflow = ${JSON.stringify(inner, null, 2)};
         maxIterations: inner.guardrails?.maxIterations ?? state.guardrails.maxIterations,
         pre: [...state.guardrails.pre ?? [], ...inner.guardrails?.pre ?? []],
         post: [...state.guardrails.post ?? [], ...inner.guardrails?.post ?? []]
-      },
-      overrides: state.overrides,
-      hooks: state.hooks,
-      storage: state.storage
+      }
     };
     try {
       await executeNode(inner.graph.start, null, innerState);
@@ -491,8 +684,26 @@ export const workflow: Workflow = ${JSON.stringify(inner, null, 2)};
     await state.storage.saveWorkflow(inner.id, readFileSync(join(runDir, workflowFile), "utf8"));
     await emitHook("SubworkflowEnd", { nodeId, innerContext: innerState.context }, state);
     const next = node.options?.["done"];
+    await nodeEnd(next ?? null);
     if (next)
       return executeNode(next, nodeId, state);
+    return;
+  }
+  if (node.type && !BUILTIN_NODE_TYPES.has(node.type)) {
+    const def = state.nodeTypes.get(node.type);
+    if (!def)
+      return errorFallback(state, nodeId, node, `unknown node.type "${node.type}" — no built-in handler and no plugin in <search>/nodes/`);
+    if (def.validate) {
+      const err = def.validate(node, state.graph);
+      if (err)
+        return errorFallback(state, nodeId, node, `node-type validation: ${err}`);
+    }
+    try {
+      await def.execute(buildNodeExecuteCtx(node, fromNodeId, state));
+    } catch (err) {
+      return errorFallback(state, nodeId, node, String(err));
+    }
+    await nodeEnd(null);
     return;
   }
   const { guardrails, iterationCounts } = state;
@@ -501,76 +712,36 @@ export const workflow: Workflow = ${JSON.stringify(inner, null, 2)};
   if (guardrails.maxIterations && count > guardrails.maxIterations)
     return writePause(state, nodeId, fromNodeId, `node "${nodeId}" exceeded max iterations (${guardrails.maxIterations})`);
   if (guardrails.pre?.length) {
-    const pre = runGuardrails(guardrails.pre, { context, nodeId });
-    if (!pre.pass) {
-      const reason = pre.reason;
-      await emitHook("GuardrailFail", { nodeId, phase: "pre", reason }, state);
-      return writePause(state, nodeId, fromNodeId, `pre-guardrail: ${reason}`);
+    const preReason = runGuardrails(guardrails.pre, { context, nodeId });
+    if (preReason) {
+      await emitHook("GuardrailFail", { nodeId, phase: "pre", reason: preReason }, state);
+      return writePause(state, nodeId, fromNodeId, `pre-guardrail: ${preReason}`);
     }
   }
-  const sliced = sliceContext(context, node.slice);
-  const userPrompt = renderUserPrompt(sliced, node.instruction);
-  const sysPrompt = buildSystemPrompt(state.registry, node);
-  const def = state.registry[node.agent];
-  const command = state.overrides.provider ?? def.command;
-  const model = state.overrides.model ?? def.model;
-  const preDirective = await emitHook("PreAgent", {
-    nodeId,
-    agent: node.agent,
-    provider: command,
-    userPrompt,
-    systemPrompt: sysPrompt,
-    slicedContext: sliced
-  }, state);
-  if (await applyDirective(preDirective, state, nodeId, node, fromNodeId))
+  const piped = await runAgentPipeline(node, state, fromNodeId);
+  if ("redirected" in piped) {
+    await nodeEnd(null);
     return;
-  const logFile = state.storage.logPath(state.runDir, node.id);
-  const preProviderDirective = await emitHook("PreProvider", {
-    nodeId,
-    agent: node.agent,
-    provider: command,
-    userPrompt,
-    systemPrompt: sysPrompt,
-    cwd: resolve(node.cwd ?? process.cwd()),
-    model,
-    logFile
-  }, state);
-  if (await applyDirective(preProviderDirective, state, nodeId, node, fromNodeId))
-    return;
-  let result;
-  try {
-    result = await invokeAgent(node, state, { userPrompt, systemPrompt: sysPrompt });
-  } catch (err) {
-    return errorFallback(state, nodeId, node, String(err));
   }
-  const postDirective = await emitHook("PostAgent", {
-    nodeId,
-    agent: node.agent,
-    provider: command,
-    result,
-    transcriptPath: result.transcriptPath
-  }, state);
-  if (await applyDirective(postDirective, state, nodeId, node, fromNodeId))
-    return;
+  let result = piped;
   if (guardrails.post?.length) {
-    const post = runGuardrails(guardrails.post, { context, nodeId, output: result.output, choice: result.choice });
-    if (!post.pass) {
-      const postReason = post.reason;
-      await emitHook("GuardrailFail", { nodeId, phase: "post", reason: postReason }, state);
+    const check = () => runGuardrails(guardrails.post, { context, nodeId, output: result.output, choice: result.choice });
+    let reason = check();
+    if (reason) {
+      await emitHook("GuardrailFail", { nodeId, phase: "post", reason }, state);
       const retryNode = { ...node, instruction: `${node.instruction ?? ""}
 
-GUARDRAIL FEEDBACK: ${postReason}
+GUARDRAIL FEEDBACK: ${reason}
 Fix the issue and try again.` };
       try {
         result = await invokeAgent(retryNode, state);
-      } catch (err) {
-        return writePause(state, nodeId, fromNodeId, `post-guardrail: ${postReason} (retry failed)`);
+      } catch {
+        return writePause(state, nodeId, fromNodeId, `post-guardrail: ${reason} (retry failed)`);
       }
-      const post2 = runGuardrails(guardrails.post, { context, nodeId, output: result.output, choice: result.choice });
-      if (!post2.pass) {
-        const post2Reason = post2.reason;
-        await emitHook("GuardrailFail", { nodeId, phase: "post", reason: post2Reason }, state);
-        return writePause(state, nodeId, fromNodeId, `post-guardrail: ${post2Reason} (after retry)`);
+      reason = check();
+      if (reason) {
+        await emitHook("GuardrailFail", { nodeId, phase: "post", reason }, state);
+        return writePause(state, nodeId, fromNodeId, `post-guardrail: ${reason} (after retry)`);
       }
     }
   }
@@ -579,7 +750,29 @@ Fix the issue and try again.` };
     return errorFallback(state, nodeId, node, `choice "${result.choice}" not declared`);
   context[nodeId] = result.output;
   await saveContext(state);
+  await nodeEnd(nextNodeId);
   return executeNode(nextNodeId, nodeId, state);
+}
+function buildNodeExecuteCtx(node, fromNodeId, state) {
+  return {
+    node,
+    fromNodeId,
+    context: state.context,
+    runId: state.runId,
+    runDir: state.runDir,
+    storage: state.storage,
+    slice: (keys) => sliceContext(state.context, keys),
+    render: (instruction, keys) => renderUserPrompt(sliceContext(state.context, keys), instruction),
+    saveContext: () => saveContext(state),
+    executeNode: (id, from) => executeNode(id, from, state),
+    invokeAgent: (n, pre) => invokeAgent(n, state, pre),
+    runAgent: (n) => runAgentPipeline(n, state, fromNodeId),
+    emitHook: (event, payload) => emitHook(event, payload, state),
+    writePause: (reason) => writePause(state, node.id, fromNodeId, reason),
+    errorFallback: (error) => errorFallback(state, node.id, node, error),
+    resolveFallback: () => resolveFallback(node, state.graph),
+    log: (line) => state.storage.appendLog(state.runDir, line)
+  };
 }
 async function buildCatalog(storage) {
   const s = storage ?? await loadStorage();
@@ -591,66 +784,49 @@ async function buildCatalog(storage) {
 ${lines.join(`
 `)}`;
 }
+async function buildRunState(runId, runDir, workflow, context, iterationCounts, overrides, storage) {
+  const [hooks, nodeTypes] = await Promise.all([loadHooks(runDir), loadNodeTypes(runDir)]);
+  return {
+    runId,
+    runDir,
+    context,
+    joinMap: new Map,
+    iterationCounts,
+    graph: workflow.graph,
+    registry: workflow.registry,
+    guardrails: workflow.guardrails ?? {},
+    hooks,
+    nodeTypes,
+    storage,
+    overrides
+  };
+}
 async function run({ workflow, initialContext = {}, overrides = {} }) {
-  const { graph, registry } = workflow;
   const storage = await loadStorage();
   const runId = `${workflow.id}-${Date.now()}`;
   const runDir = await storage.createRun(runId);
-  const hooks = await loadHooks(runDir);
-  const state = {
-    runId,
-    runDir,
-    context: { ...initialContext },
-    joinMap: new Map,
-    iterationCounts: new Map,
-    graph,
-    registry,
-    guardrails: workflow.guardrails ?? {},
-    hooks,
-    storage,
-    overrides
-  };
-  const startDirective = await emitHook("RunStart", { workflow, initialContext }, state);
-  if (startDirective.action === "abort") {
-    throw new Error(`Aborted by hook: ${startDirective.reason}`);
-  }
-  await executeNode(graph.start, null, state);
+  const state = await buildRunState(runId, runDir, workflow, { ...initialContext }, new Map, overrides, storage);
+  abortIfHook(await emitHook("RunStart", { workflow, initialContext }, state));
+  await executeNode(workflow.graph.start, null, state);
 }
 async function resume({ workflow, runId, choice, overrides = {} }) {
-  const { graph, registry } = workflow;
   const storage = await loadStorage();
-  const runDir = join("/tmp/orchestrator", runId);
+  const runDir = storage.runDir(runId);
   if (!await storage.pauseExists(runDir))
     throw new Error(`No paused state for run: ${runId}`);
   const paused = await storage.loadPause(runDir);
-  const hooks = await loadHooks(runDir);
-  const fromNode = graph.nodes.find((n) => n.id === paused.nodeId);
+  const fromNode = workflow.graph.nodes.find((n) => n.id === paused.nodeId);
   if (!fromNode?.options?.[choice])
     throw new Error(`Choice "${choice}" not valid for "${paused.nodeId}". Options: ${Object.keys(fromNode?.options ?? {})}`);
-  const restoredIterations = new Map(Object.entries(paused.iterationCounts ?? {}));
-  const state = {
-    runId,
-    runDir,
-    context: paused.context,
-    joinMap: new Map,
-    iterationCounts: restoredIterations,
-    graph,
-    registry,
-    guardrails: workflow.guardrails ?? {},
-    hooks,
-    storage,
-    overrides
-  };
-  const resumeDirective = await emitHook("Resumed", { nodeId: paused.nodeId, choice }, state);
-  if (resumeDirective.action === "abort") {
-    throw new Error(`Aborted by hook: ${resumeDirective.reason}`);
-  }
+  const iterationCounts = new Map(Object.entries(paused.iterationCounts ?? {}));
+  const state = await buildRunState(runId, runDir, workflow, paused.context, iterationCounts, overrides, storage);
+  abortIfHook(await emitHook("Resumed", { nodeId: paused.nodeId, choice }, state));
   await executeNode(fromNode.options[choice], paused.nodeId, state);
 }
 
 // ../../../../private/tmp/supertinker-entry-XXXX.ts
-var EMBEDDED = { "providers/claude.ts": `import { spawn } from "child_process"
-import { appendFileSync, writeFileSync } from "fs"
+var EMBEDDED = { "providers/claude.ts": `import { spawn, ChildProcess } from "child_process"
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "fs"
 import { randomUUID } from "crypto"
 import type { DisplayEvent, TranscriptMapper } from "../display-protocol.js"
 
@@ -661,73 +837,254 @@ interface ProviderContext {
   cwd:          string
   model?:       string
   logFile:      string
+  onChunk?:     (chunk: string) => void
+  signal?:      AbortSignal
 }
 
 interface AgentResult {
   output: string
   choice: string
   transcriptPath?: string
+  metadata?: Record<string, unknown>
 }
 
-function run(command: string, args: string[], cwd: string, logFile: string): Promise<string> {
+// \u2500\u2500\u2500 Session sidecar \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+// When the same node invokes the Claude provider more than once (typical for
+// \`persistent\` nodes driven by an event loop), we want Claude to keep its
+// conversation history instead of starting fresh each turn. We persist the
+// first turn's session_id in a sidecar file next to the node's log, and
+// switch to \`--resume <id>\` on every subsequent turn.
+
+function sessionPathFor(logFile: string): string {
+  return logFile.replace(/\\.log$/, ".session")
+}
+function readExistingSession(logFile: string): string | null {
+  const p = sessionPathFor(logFile)
+  if (!existsSync(p)) return null
+  const id = readFileSync(p, "utf8").trim()
+  return id.length > 0 ? id : null
+}
+function writeSession(logFile: string, sessionId: string): void {
+  writeFileSync(sessionPathFor(logFile), sessionId)
+}
+
+// \u2500\u2500\u2500 Child-process lifecycle \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+// Track every live Claude subprocess so we can guarantee it's dead when the
+// orchestrator exits. Without this, \`cli.ts\` calls \`process.exit(0)\` after a
+// --quiet run completes, which abandons any still-running \`claude\` child to
+// init \u2014 it keeps burning tokens until it finishes on its own.
+//
+// On abort (AbortSignal or parent exit) we SIGTERM first, then SIGKILL after
+// a short grace period. \`spawn\` is called without \`detached:true\`/\`unref()\`
+// so the child stays in our process group and \`process.on("exit")\` can reach
+// it synchronously.
+
+const liveChildren = new Set<ChildProcess>()
+let exitHookInstalled = false
+function installExitHook(): void {
+  if (exitHookInstalled) return
+  exitHookInstalled = true
+  const killAll = () => {
+    for (const p of liveChildren) { try { p.kill("SIGKILL") } catch {} }
+  }
+  // 'exit' is the only place we're guaranteed synchronous cleanup before
+  // Node tears down. Signals arrive before exit, so handle them too \u2014 we
+  // re-raise after cleanup so the default termination behavior still runs.
+  process.on("exit", killAll)
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    process.on(sig, () => { killAll(); process.exit(128) })
+  }
+}
+
+function trackChild(proc: ChildProcess): void {
+  installExitHook()
+  liveChildren.add(proc)
+  proc.once("close", () => liveChildren.delete(proc))
+}
+
+function killWithEscalation(proc: ChildProcess): void {
+  try { proc.kill("SIGTERM") } catch {}
+  // If SIGTERM is ignored, escalate after 2s. Clear timer if the child exits
+  // on its own so we don't leak a timer handle.
+  const esc = setTimeout(() => { try { proc.kill("SIGKILL") } catch {} }, 2000)
+  proc.once("close", () => clearTimeout(esc))
+}
+
+// \u2500\u2500\u2500 Blocking (non-streaming) execution \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+function runBlocking(command: string, args: string[], cwd: string, logFile: string, signal?: AbortSignal): Promise<string> {
   return new Promise((res, rej) => {
-    const proc = spawn(command, args, { cwd, env: process.env, detached: true, stdio: ["pipe", "pipe", "pipe"] })
-    proc.unref()
+    const proc = spawn(command, args, { cwd, env: process.env, stdio: ["pipe", "pipe", "pipe"] })
+    trackChild(proc)
     let out = "", err = ""
-    proc.stdout.on("data", (chunk: Buffer) => {
+    const onAbort = () => killWithEscalation(proc)
+    signal?.addEventListener("abort", onAbort, { once: true })
+    proc.stdout!.on("data", (chunk: Buffer) => {
       const txt = chunk.toString(); out += txt
       appendFileSync(logFile, txt)
     })
-    proc.stderr.on("data", (chunk: Buffer) => { err += chunk.toString() })
-    proc.on("close", code => code === 0 ? res(out) : rej(new Error(\`exit \${code}: \${err.slice(0, 300)}\`)))
-    proc.stdin.end()
+    proc.stderr!.on("data", (chunk: Buffer) => { err += chunk.toString() })
+    proc.on("close", code => {
+      signal?.removeEventListener("abort", onAbort)
+      if (signal?.aborted) return rej(new Error(\`Aborted: \${(signal as any).reason?.message ?? "signal"}\`))
+      code === 0 ? res(out) : rej(new Error(\`exit \${code}: \${err.slice(0, 300)}\`))
+    })
+    proc.stdin!.end()
   })
 }
 
-export async function invoke(ctx: ProviderContext): Promise<AgentResult> {
-  const schema = JSON.stringify({
-    type: "object",
-    required: ["output", "choice"],
-    properties: {
-      output: { type: "string" },
-      choice: { type: "string", enum: ctx.options },
-    },
+// \u2500\u2500\u2500 Streaming (stream-json) execution \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+// Parses NDJSON events, forwards text_delta to ctx.onChunk, captures the final
+// "result" event. Also captures session_id for the sidecar.
+
+interface StreamedResult {
+  output:   string
+  sessionId?: string
+}
+
+function runStreaming(
+  command: string, args: string[], cwd: string, logFile: string,
+  onChunk: (chunk: string) => void, signal?: AbortSignal,
+): Promise<StreamedResult> {
+  return new Promise((res, rej) => {
+    const proc: ChildProcess = spawn(command, args, { cwd, env: process.env, stdio: ["pipe", "pipe", "pipe"] })
+    trackChild(proc)
+
+    let buf = "", err = ""
+    let accumulated = ""
+    let finalResult: string | undefined
+    let sessionId:   string | undefined
+
+    const onAbort = () => killWithEscalation(proc)
+    signal?.addEventListener("abort", onAbort, { once: true })
+
+    const handleLine = (line: string) => {
+      if (!line.trim()) return
+      appendFileSync(logFile, line + "\\n")
+      let evt: any
+      try { evt = JSON.parse(line) } catch { return }
+
+      // Top-level session_id (on init and result events)
+      if (typeof evt.session_id === "string") sessionId = evt.session_id
+
+      // Anthropic-style stream_event wrapper with partial message deltas
+      if (evt.type === "stream_event" && evt.event?.type === "content_block_delta") {
+        const delta = evt.event.delta
+        if (delta?.type === "text_delta" && typeof delta.text === "string") {
+          accumulated += delta.text
+          try { onChunk(delta.text) } catch {}
+          return
+        }
+      }
+
+      // Assistant message blocks sometimes carry the final text
+      if (evt.type === "assistant" && Array.isArray(evt.message?.content)) {
+        for (const block of evt.message.content) {
+          if (block.type === "text" && typeof block.text === "string" && !accumulated.endsWith(block.text)) {
+            // Don't double-count if streamed deltas already covered this text.
+            // (The CLI may emit both deltas and the full assistant message.)
+          }
+        }
+      }
+
+      // Terminal result event \u2014 authoritative output
+      if (evt.type === "result") {
+        if (typeof evt.result === "string") finalResult = evt.result
+      }
+    }
+
+    proc.stdout!.on("data", (chunk: Buffer) => {
+      buf += chunk.toString()
+      const lines = buf.split(/\\r?\\n/)
+      buf = lines.pop() ?? ""
+      for (const line of lines) handleLine(line)
+    })
+    proc.stderr!.on("data", (chunk: Buffer) => { err += chunk.toString() })
+    proc.on("close", code => {
+      signal?.removeEventListener("abort", onAbort)
+      if (buf.trim()) handleLine(buf)
+      if (signal?.aborted) return rej(new Error(\`Aborted: \${(signal as any).reason?.message ?? "signal"}\`))
+      if (code !== 0) return rej(new Error(\`exit \${code}: \${err.slice(0, 400)}\`))
+      res({ output: finalResult ?? accumulated, sessionId })
+    })
+    proc.stdin?.end()
   })
+}
 
-  const sessionId = randomUUID()
+// \u2500\u2500\u2500 Public entrypoint \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
-  // Write meta sidecar for dashboard
-  // Find the transcript by searching for the sessionId.jsonl file across Claude project dirs
+export async function invoke(ctx: ProviderContext): Promise<AgentResult> {
+  const existingSession = readExistingSession(ctx.logFile)
+  const sessionId       = existingSession ?? randomUUID()
+  const streaming       = typeof ctx.onChunk === "function"
+
+  // Dashboard meta sidecar
   const claudeProjects = \`\${process.env.HOME}/.claude/projects\`
-  const metaPath = ctx.logFile.replace(/\\.log$/, ".meta.json")
-  const transcriptFile = \`\${sessionId}.jsonl\`
+  const metaPath       = ctx.logFile.replace(/\\.log$/, ".meta.json")
+  writeFileSync(metaPath, JSON.stringify({
+    transcriptFile: \`\${sessionId}.jsonl\`, sessionId, claudeProjects, provider: "claude",
+  }))
 
-  // Write initial meta with a glob pattern \u2014 dashboard will resolve it
-  writeFileSync(metaPath, JSON.stringify({ transcriptFile, sessionId, claudeProjects, provider: "claude" }))
-
-  const args = [
+  // Argument assembly. Streaming mode drops --json-schema because stream-json
+  // and schema validation don't compose; free-form output is fine for any
+  // caller that opts into streaming (typically \`persistent\` nodes).
+  const baseArgs: string[] = [
     "-p", ctx.userPrompt,
     "--system-prompt", ctx.systemPrompt,
-    "--output-format", "json",
-    "--json-schema", schema,
-    "--dangerously-skip-permissions",
-    "--session-id", sessionId,
+    "--permission-mode", "auto",
+    ...(existingSession ? ["--resume", existingSession] : ["--session-id", sessionId]),
     ...(ctx.model ? ["--model", ctx.model] : []),
   ]
 
-  const raw = await run("claude", args, ctx.cwd, ctx.logFile)
-
-  const parsed = JSON.parse(raw.trim())
   let result: AgentResult
-  if (parsed.output !== undefined && parsed.choice !== undefined) result = parsed
-  else if (parsed.structured_output?.output !== undefined && parsed.structured_output?.choice !== undefined) result = parsed.structured_output
-  else if (parsed.result) result = JSON.parse(parsed.result)
-  else throw new Error(\`Unexpected Claude output shape: \${raw.slice(0, 200)}\`)
+  if (streaming) {
+    const args = [...baseArgs, "--output-format", "stream-json", "--verbose", "--include-partial-messages"]
+    const streamed = await runStreaming("claude", args, ctx.cwd, ctx.logFile, ctx.onChunk!, ctx.signal)
+    result = {
+      output:   streamed.output,
+      choice:   ctx.options[0] ?? "",
+      metadata: { sessionId: streamed.sessionId ?? sessionId, streaming: true },
+    }
+    if (streamed.sessionId) writeSession(ctx.logFile, streamed.sessionId)
+    else if (!existingSession) writeSession(ctx.logFile, sessionId)
+  } else {
+    // An empty options array would make the schema's choice.enum empty, which
+    // the Claude CLI silently treats as "no schema" \u2014 the agent then returns
+    // prose in \`result\` and no \`structured_output\`. For choice-less callers
+    // (e.g. persistent nodes that strip options) skip the schema entirely and
+    // take the raw result as free-form output.
+    const hasOptions = ctx.options.length > 0
+    const args = [...baseArgs, "--output-format", "json"]
+    if (hasOptions) {
+      const schema = JSON.stringify({
+        type: "object",
+        required: ["output", "choice"],
+        properties: {
+          output: { type: "string" },
+          choice: { type: "string", enum: ctx.options },
+        },
+      })
+      args.push("--json-schema", schema)
+    }
+    const raw = await runBlocking("claude", args, ctx.cwd, ctx.logFile, ctx.signal)
+    const parsed = JSON.parse(raw.trim())
+    if (hasOptions) {
+      if (parsed.output !== undefined && parsed.choice !== undefined) result = parsed
+      else if (parsed.structured_output?.output !== undefined && parsed.structured_output?.choice !== undefined) result = parsed.structured_output
+      else if (parsed.result) result = JSON.parse(parsed.result)
+      else throw new Error(\`Unexpected Claude output shape: \${raw.slice(0, 200)}\`)
+    } else {
+      // Non-empty marker so PostAgent hooks (e.g. retry) don't misread a
+      // free-form call as a failed sentinel. Persistent-style callers
+      // ignore \`choice\` downstream.
+      result = { output: parsed.result ?? "", choice: "ok" }
+    }
+    result.metadata = { sessionId: parsed.session_id ?? sessionId, streaming: false }
+    // Persist session for future turns
+    if (!existingSession) writeSession(ctx.logFile, parsed.session_id ?? sessionId)
+  }
 
-  result.transcriptPath = parsed.session_id
-    ? \`\${sessionId}.jsonl\`
-    : undefined
-
+  result.transcriptPath = \`\${sessionId}.jsonl\`
   return result
 }
 
@@ -737,10 +1094,8 @@ export const mapTranscript: TranscriptMapper = (line: string) => {
 
   const ts = parsed.timestamp ? new Date(parsed.timestamp).getTime() : Date.now()
 
-  // Skip non-display events
   if (parsed.type === "queue-operation" || parsed.type === "attachment" || parsed.type === "system") return null
 
-  // User events \u2014 look for tool_result
   if (parsed.type === "user" && Array.isArray(parsed.message?.content)) {
     const events: DisplayEvent[] = []
     for (const block of parsed.message.content) {
@@ -762,7 +1117,6 @@ export const mapTranscript: TranscriptMapper = (line: string) => {
     return events.length > 0 ? events : null
   }
 
-  // Assistant events
   if (parsed.type === "assistant" && Array.isArray(parsed.message?.content)) {
     const events: DisplayEvent[] = []
     for (const block of parsed.message.content) {
@@ -800,7 +1154,7 @@ export const mapTranscript: TranscriptMapper = (line: string) => {
   return null
 }
 ` };
-var BUILD_STAMP = "2026-04-16T15:39:53.157Z";
+var BUILD_STAMP = "2026-04-17T15:19:21.651Z";
 var userDir = join2(homedir2(), ".supertinker");
 var stampFile = join2(userDir, ".builtin-stamp");
 var needsExtract = !existsSync2(stampFile) || readFileSync2(stampFile, "utf8").trim() !== BUILD_STAMP;
