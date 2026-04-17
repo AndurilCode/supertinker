@@ -21,7 +21,7 @@ export const workflow: Workflow = {
         // `director`  — prior reply, for loop continuity.
         slice:   ["event", "director", "cwd", "launcher"],
         options: { event: "director" },    // loop back on resume
-        timeout: 900_000,                   // 15 min — creating + running workflows takes time
+        timeout: 7_200_000,                 // 2 h — creating + launching workflows + composing a reply can be long
         instruction: [
           "You are a director agent running inside supertinker — a persistent chat that creates, launches, and extends supertinker workflows on the user's behalf.",
           "",
@@ -85,6 +85,15 @@ export const workflow: Workflow = {
           "",
           "# Response style",
           "Respond conversationally. Do the work, then summarize what you did and what's next.",
+          "",
+          "# CRITICAL — response format",
+          "Every reply — no exceptions — MUST end with this exact literal block, on its own lines, with no surrounding prose:",
+          "",
+          "---CHOICE---",
+          "event",
+          "---END---",
+          "",
+          "This sentinel is a machine parser — not decoration. Without it, your entire reply is discarded and the turn fails. There is only ever one option (`event`), so the value is always literally the word `event`. Emit the sentinel even if your reply is short, even if no tools were used, even if you are only acknowledging.",
         ].join("\n"),
       },
       { id: "done",   type: "done" },
