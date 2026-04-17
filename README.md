@@ -167,67 +167,17 @@ Providers and workflows **override** by name (first match wins). Hooks **merge**
 <details>
 <summary><strong>Writing a plugin</strong></summary>
 
-Create a directory under `plugins/<type>/<name>/` with a `manifest.json`:
+Each plugin is a directory under `plugins/<type>/<name>/` with a `manifest.json` (declaring `name`, `type`, `description`, `files`, `version`) plus the implementation files it references. Users install it with `plugins install <name>`.
 
-```json
-{
-  "name": "my-hook",
-  "type": "hook",
-  "description": "What it does",
-  "files": ["my-hook.ts"],
-  "version": "1.0.0"
-}
-```
-
-Place implementation files alongside the manifest. Users install with `plugins install my-hook`.
+For scaffolding, schemas, and worked examples, invoke the **`supertinker`** skill — its `references/<type>.md` files are the authoritative authoring guide, one per plugin type (`workflows`, `providers`, `hooks`, `storage`, `commands`, `nodes`).
 
 </details>
 
 ## Writing workflows
 
-Workflows are plain TypeScript objects implementing the `Workflow` interface from `supertinker.ts`.
+A workflow is a TypeScript object implementing the `Workflow` interface exported by `supertinker.ts`. It declares an `id`, a `description`, an `AgentRegistry` (agent name → `command` / `model` / `systemPrompt`), a `Graph` (`start`, `fallback`, `labels`, `nodes`), and optional `guardrails`. Each node picks its next edge from the label the agent emits.
 
-```typescript
-import type { Workflow, GuardrailCheck } from "../supertinker"
-
-const planHasStructure: GuardrailCheck = ({ nodeId, output }) => {
-  if (nodeId !== "plan" || !output) return { pass: true }
-  if (!output.includes("## Steps")) return { pass: false, reason: "Plan missing '## Steps' section" }
-  return { pass: true }
-}
-
-export const workflow: Workflow = {
-  id: "plan-develop-review",
-  description: "Plan, implement, and review a TypeScript feature",
-  guardrails: { post: [planHasStructure], maxIterations: 3 },
-
-  registry: {
-    planner:     { command: "claude", model: "sonnet", systemPrompt: "You are a planning agent..." },
-    claude_code: { command: "claude", model: "sonnet", systemPrompt: "You are a TypeScript engineer..." },
-    reviewer:    { command: "copilot",                 systemPrompt: "You are a code reviewer..." },
-  },
-
-  graph: {
-    id: "plan-develop-review",
-    start: "plan",
-    fallback: "human_review",
-    labels: ["done", "approved", "needs_work", "needs_clarify"],
-    nodes: [
-      { id: "plan", agent: "planner",
-        instruction: "Produce a detailed implementation plan",
-        options: { done: "develop", needs_clarify: "human_review" } },
-      { id: "develop", agent: "claude_code", slice: ["task", "plan"],
-        instruction: "Implement the plan described in [plan]",
-        options: { done: "review", needs_clarify: "human_review" } },
-      { id: "review", agent: "reviewer", slice: ["task", "plan", "develop"],
-        instruction: "Review [develop] against [plan]",
-        options: { approved: "complete", needs_work: "develop" } },
-      { id: "complete",     type: "done" },
-      { id: "human_review", type: "paused" },
-    ],
-  },
-}
-```
+For a ready-to-copy scaffold, guardrail recipes, and the full node catalog, invoke the **`supertinker`** skill and open `references/workflows.md`.
 
 ### Node types
 
@@ -244,163 +194,46 @@ export const workflow: Workflow = {
 
 ### Context references
 
-Use `[nodeId]` in an instruction to inject a prior node's output:
+Use `[nodeId]` inside an `instruction` to inject a prior node's output — e.g. *"Review the code in [develop] against the plan in [plan]"*. The `validate-templates` hook pre-flights these references against real node IDs.
 
-```
-"Review the code in [develop] against the plan in [plan]"
-```
+### Extension points at a glance
 
-<details>
-<summary><strong>Guardrails</strong></summary>
+| Extension | Drop-in location | Purpose |
+|-----------|------------------|---------|
+| **Hook** | `.supertinker/hooks/` · `~/.supertinker/hooks/` | React to lifecycle events; return a directive (`continue` / `skip` / `pause` / `redirect` / `abort`). Highest-rank directive wins. |
+| **Provider** | `.supertinker/providers/` · `~/.supertinker/providers/` | Agent CLI adapter loaded lazily by the registry's `command` field. |
+| **Node type** | `.supertinker/nodes/` · `~/.supertinker/nodes/` · `plugins/nodes/<name>/` | Register a new `type` with its own `execute(ctx)` body; project → user → built-in, first match wins. Built-ins (`fork`, `join`, `done`, `failed`, `paused`, `subworkflow`) cannot be shadowed. |
+| **Command** | `.supertinker/commands/` · `~/.supertinker/commands/` · `plugins/commands/<name>/` | Add a CLI subcommand that shows up in `supertinker --help`. |
+| **Storage adapter** | `.supertinker/storage/` · `~/.supertinker/storage/` | Partial `StorageAdapter` — override only the methods you need (`createRun`, `saveContext`, `loadContext`, `savePause`, `loadPause`, `pauseExists`, `appendLog`, `saveFile`, `saveWorkflow`, `logPath`). |
+| **Workflow** | `.supertinker/workflows/` · `~/.supertinker/workflows/` · `plugins/workflows/<name>/` | Named, reusable graph bundles loaded by `--workflow <name>`. |
 
-Pre- and post-execution checks. Failing post-guardrails retry once (with failure reason injected), then pause. Failing pre-guardrails pause immediately.
+### Guardrails
 
-```typescript
-guardrails: {
-  maxIterations: 3,
-  pre:  [{ check: "context.task?.length > 0", reason: "Task is empty" }],
-  post: [
-    { check: "output.trim().length > 0",                          reason: "Empty output" },
-    { check: "output.length < 10000",                             reason: "Output too long" },
-    { check: "!/(sk-|ghp_|AKIA)[A-Za-z0-9]{10,}/.test(output)", reason: "Contains API key" },
-  ],
-}
-```
+Pre- and post-execution checks declared on the workflow (`guardrails.pre`, `guardrails.post`) — either `GuardrailCheck` functions or `GuardrailRule` JS expressions. Failing post-guardrails retry once with the failure reason injected, then pause; failing pre-guardrails pause immediately. Expression variables: `output`, `choice`, `nodeId`, `context`, `require` (CJS require).
 
-Variables available: `output`, `choice`, `nodeId`, `context`, `require` (CJS require).
+### Hooks
 
-</details>
+Hooks react to built-in lifecycle events — `RunStart` · `RunEnd` · `NodeStart` · `NodeEnd` · `PreAgent` · `PreProvider` · `PostAgent` · `Paused` · `Resumed` · `ForkStart` · `ForkJoin` · `GuardrailFail` · `SubworkflowStart` · `SubworkflowEnd` · `Error` — plus any string event emitted by a custom node via `ctx.emitHook(...)`. Directive support:
 
-<details>
-<summary><strong>Writing a hook</strong></summary>
+| Directive | Events |
+|-----------|--------|
+| `continue` | all events |
+| `skip` | `PreAgent`, `PreProvider` |
+| `pause` | `PreAgent`, `PreProvider`, `PostAgent`, `GuardrailFail`, `SubworkflowStart`, `NodeStart` |
+| `redirect` | `PreAgent`, `PreProvider`, `PostAgent` |
+| `abort` | all events |
 
-Place a `.ts` or `.js` file in `.supertinker/hooks/` (project-local) or `~/.supertinker/hooks/` (global). Export a `Hook` object:
+When multiple hooks fire on the same event, highest-rank wins: `abort > pause > redirect > skip > continue`.
 
-```typescript
-import type { Hook } from "../supertinker"
+### Writing your own
 
-export const hook: Hook = {
-  name: "block-on-test-failure",
-  events: ["PostAgent"],
-  priority: 50,
-  handler: async (event) => {
-    const e = event as Extract<typeof event, { event: "PostAgent" }>
-    if (e.nodeId === "test" && e.result.choice !== "passed")
-      return { action: "pause", reason: "Tests did not pass" }
-    return { action: "continue" }
-  },
-}
-```
-
-**Directives:** `continue` (all events) · `skip` (PreAgent, PreProvider) · `pause` (PreAgent, PreProvider, PostAgent, GuardrailFail, SubworkflowStart, NodeStart) · `redirect` (PreAgent, PreProvider, PostAgent) · `abort` (all events)
-
-When multiple hooks fire, highest-rank wins: `abort > pause > redirect > skip > continue`.
-
-**Events:** `RunStart` · `RunEnd` · `NodeStart` · `NodeEnd` · `PreAgent` · `PreProvider` · `PostAgent` · `Paused` · `Resumed` · `ForkStart` · `ForkJoin` · `GuardrailFail` · `SubworkflowStart` · `SubworkflowEnd` · `Error`
-
-Custom node plugins may also emit arbitrary string event names via `ctx.emitHook(...)`; hooks subscribe to them by listing the same name in their `events` array.
-
-</details>
-
-<details>
-<summary><strong>Writing a custom provider</strong></summary>
-
-Place a `.ts` or `.js` file in `.supertinker/providers/` or `~/.supertinker/providers/`. Export an `invoke` function:
-
-```typescript
-export async function invoke(ctx: {
-  userPrompt: string; systemPrompt: string; options: string[]
-  cwd: string; model?: string; logFile: string
-}): Promise<{ output: string; choice: string; transcriptPath?: string }> {
-  // Spawn your agent CLI, capture output, return output + one of ctx.options
-}
-```
-
-Loaded lazily by name from the registry's `command` field. `command: "my-provider"` loads `providers/my-provider.ts`.
-
-</details>
-
-<details>
-<summary><strong>Writing a custom node type</strong></summary>
-
-Place a `.ts` or `.js` file in `.supertinker/nodes/`, `~/.supertinker/nodes/`, or ship it as a plugin under `plugins/nodes/<name>/`. Export a `NodeTypeDefinition` with a unique `type` string, an optional `schema` (`requires`/`optional`/`example`), an optional `validate(node, graph)` pre-flight, and an `execute(ctx)` body.
-
-The `ctx` passed to `execute` exposes the stable surface custom nodes rely on: `context`, `slice()`, `render()`, `executeNode()`, `runAgent()`, `invokeAgent()`, `emitHook()`, `writePause()`, `errorFallback()`, `resolveFallback()`, `saveContext()`, and `log()`. Node plugins that invoke agents should prefer `runAgent(node)` so the full `PreAgent → PreProvider → PostAgent` hook chain (and its directives) fires exactly as for standard nodes — a `{ redirected: true }` result means a hook already moved execution elsewhere.
-
-**Search order:** project → user → built-in, first match wins. Built-in types (`fork`, `join`, `done`, `failed`, `paused`, `subworkflow`) cannot be shadowed.
-
-</details>
-
-<details>
-<summary><strong>Writing a command plugin</strong></summary>
-
-Command plugins extend the CLI itself — everything after `supertinker <name> …` is routed to your handler, and the command shows up in `supertinker --help` automatically. Built-in commands (`run`, `resume`, `status`, `list`, `plugins`) implement the same `CommandPlugin` contract.
-
-Place a `.ts` or `.js` file in `.supertinker/commands/`, `~/.supertinker/commands/`, or ship it as a plugin under `plugins/commands/<name>/`. Export a `CommandPlugin` with `name`, `description`, optional `usage`, and a `handler(args, get)` where `get(flag)` resolves `--flag value` / `--flag=value` from the argument list.
-
-</details>
-
-<details>
-<summary><strong>Writing a storage adapter</strong></summary>
-
-Place `storage.ts` in `.supertinker/storage/` or `~/.supertinker/storage/`. Export a partial `StorageAdapter` — only override what you need:
-
-```typescript
-import type { StorageAdapter } from "../../supertinker.js"
-
-export const storage: Partial<StorageAdapter> = {
-  async saveWorkflow(id, content) {
-    // custom persistence logic
-  },
-}
-```
-
-**Methods:** `createRun` · `saveContext` · `loadContext` · `savePause` · `loadPause` · `pauseExists` · `appendLog` · `saveFile` · `saveWorkflow` · `logPath`
-
-</details>
+Every extension — plugins, custom node types, hooks, providers, commands, storage adapters — is fully documented, with scaffolds and worked examples, in the **`supertinker`** skill under `references/<type>.md`. Invoke the skill whenever you want to build one; nothing in this README is a substitute for those files.
 
 ## Architecture
 
-```
-                         ┌──────────────────────────────┐
-  CLI                    │           cli.ts              │
-  ──────────────────────▶│  run, resume, status, list,   │
-                         │  plugins install/uninstall    │
-                         └──────────────┬───────────────┘
-                                        │ calls
-                         ┌──────────────▼───────────────┐
-                         │       supertinker.ts          │
-                         │  run() / resume() / catalog   │
-                         └──────────────┬───────────────┘
-                                        │ loads
-           ┌──────────┬──────────┬──┼─────────┬──────────┬──────────┐
-           ▼          ▼          ▼  ▼         ▼          ▼          ▼
-     Storage adapter Workflow Hook index  Providers  Node types  Commands
-     ─────────────── ──────── ──────────  ─────────  ──────────  ────────
-     filesystem      DAG      15 events   claude     fork/join   run
-     DB / S3 / …     Guardrails priority  copilot    subworkflow resume
-                              parallel/   custom     script      status
-                              sequential             choice      list
-                                                     custom      plugins
-                                                                 custom
-
-                                        │
-                                        ▼
-                              ┌─────────────────┐
-                              │  Node execution  │
-                              │  1. Slice ctx    │
-                              │  2. Render prompt│
-                              │  3. Spawn CLI    │
-                              │  4. Guardrails   │
-                              │  5. Fire hooks   │
-                              │  6. Follow edge  │
-                              └────────┬─────────┘
-                                       │
-                         ┌─────────────┴─────────────┐
-                         ▼                           ▼
-                    Fork / Join                 Subworkflow
-                    (concurrent)               (recursive run)
-```
+<p align="center">
+  <img src="docs/architecture.png" alt="supertinker architecture" width="800" />
+</p>
 
 ### Execution model
 
