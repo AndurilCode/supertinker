@@ -1,7 +1,7 @@
 {
   "name": "chat",
   "type": "command",
-  "description": "Interactive REPL: type a prompt, see the agent's reply inline",
-  "files": ["chat.ts"],
+  "description": "Interactive REPL (Ink TUI): type a prompt, see the reply, live active-runs footer",
+  "files": ["chat.ts", "chat-ui.tsx"],
   "version": "1.0.0"
 }
