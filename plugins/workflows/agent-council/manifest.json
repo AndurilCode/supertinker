@@ -1,0 +1,7 @@
+{
+  "name": "agent-council",
+  "type": "workflow",
+  "description": "Three-agent council (Codex, Gemini, Claude) review the codebase in parallel under their own training biases, then a synthesizer merges the reports.",
+  "files": ["agent-council.workflow.ts"],
+  "version": "1.0.0"
+}
