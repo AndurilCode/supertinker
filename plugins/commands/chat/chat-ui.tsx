@@ -77,6 +77,75 @@ function renderMarkdown(md: string): string {
   return out.join("\n")
 }
 
+// ─── Live activity preview (multi-provider stream events) ────────────────
+// Tails the newest per-node log (provider stream-event NDJSON) in the run
+// dir and returns a compact human-readable summary of the most recent
+// meaningful event — thinking text, output text, or a tool call. This is
+// what turns "(560s · thinking)" into "(560s · thinking — tool: Bash)" so
+// the user sees the agent is actually doing work, not hung. Recognizes
+// claude, codex, and gemini event shapes.
+function extractActivity(evt: any): string | null {
+  // Claude (--output-format stream-json): stream_event wrapper with deltas.
+  const delta = evt?.event?.delta
+  if (delta?.type === "thinking_delta" && delta.thinking) return `thinking: ${truncateTail(delta.thinking, 80)}`
+  if (delta?.type === "text_delta"     && delta.text)     return `writing: ${truncateTail(delta.text, 80)}`
+  const block = evt?.event?.content_block
+  if (block?.type === "tool_use" && block.name) return `tool: ${block.name}`
+
+  // Codex (--json): flat item.completed events.
+  if (evt?.type === "item.completed" && evt.item) {
+    const item = evt.item
+    if (item.type === "agent_message"     && typeof item.text    === "string") return `writing: ${truncateTail(item.text, 80)}`
+    if (item.type === "reasoning"         && typeof item.text    === "string") return `thinking: ${truncateTail(item.text, 80)}`
+    if (item.type === "command_execution" && typeof item.command === "string") return `tool: ${truncateTail(item.command, 80)}`
+  }
+  if (evt?.type === "turn.started")   return "thinking"
+  if (evt?.type === "thread.started") return "starting"
+
+  // Gemini (-o stream-json): flat message events.
+  if (evt?.type === "message" && evt.role === "assistant" && typeof evt.content === "string") {
+    return `writing: ${truncateTail(evt.content, 80)}`
+  }
+  if (evt?.type === "init") return "starting"
+
+  return null
+}
+
+function readLatestActivity(runDir: string): string {
+  let bestPath: string | null = null, bestMtime = 0
+  try {
+    for (const f of readdirSync(runDir)) {
+      if (!f.endsWith(".log") || f === "orchestrator.log") continue
+      const p = join(runDir, f)
+      try {
+        const m = statSync(p).mtimeMs
+        if (m > bestMtime) { bestMtime = m; bestPath = p }
+      } catch {}
+    }
+  } catch { return "" }
+  if (!bestPath) return ""
+
+  try {
+    const raw = readFileSync(bestPath, "utf8")
+    const tail = raw.length > 64 * 1024 ? raw.slice(-64 * 1024) : raw
+    const lines = tail.split("\n")
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const s = lines[i].trim()
+      if (!s || s[0] !== "{") continue
+      try {
+        const activity = extractActivity(JSON.parse(s))
+        if (activity) return activity
+      } catch {}
+    }
+  } catch {}
+  return ""
+}
+
+function truncateTail(s: string, n: number): string {
+  const clean = s.replace(/\s+/g, " ").trim()
+  return clean.length <= n ? clean : "…" + clean.slice(clean.length - n)
+}
+
 // ─── Active-runs scan ─────────────────────────────────────────────────────
 interface RunStatus {
   runId: string; currentNode: string
@@ -285,6 +354,7 @@ function Chat({ runId, workflow, choice, contextKey, replyKey, initial }: ChatPr
   const [thinking, setThinking] = useState(false)
   const [elapsed, setElapsed]   = useState(0)
   const [runs, setRuns]         = useState<RunStatus[]>(() => scanActiveRuns(runId, sessionStartMs, workflow))
+  const [activity, setActivity] = useState<string>("")
 
   // Tick a 1s counter while thinking so the spinner line reads "(Ns · thinking)".
   // Reset to zero when we enter thinking and stop ticking when we leave.
@@ -295,6 +365,14 @@ function Chat({ runId, workflow, choice, contextKey, replyKey, initial }: ChatPr
     const t = setInterval(() => setElapsed(Math.floor((Date.now() - start) / 1000)), 1000)
     return () => clearInterval(t)
   }, [thinking])
+
+  // Poll the agent's streaming log every 1s while thinking so the spinner
+  // line can report what the agent is actually doing (thinking/writing/tool).
+  useEffect(() => {
+    if (!thinking) { setActivity(""); return }
+    const t = setInterval(() => setActivity(readLatestActivity(runDir)), 1000)
+    return () => clearInterval(t)
+  }, [thinking, runDir])
 
   // Refresh active runs every 1s so status flips (paused → running → paused)
   // during a resume are visible while the user waits for a reply.
@@ -465,9 +543,12 @@ function Chat({ runId, workflow, choice, contextKey, replyKey, initial }: ChatPr
         }}
       </Static>
 
-      <Box marginTop={1} marginBottom={1}>
+      <Box marginTop={1} marginBottom={1} flexDirection="column">
         {thinking ? (
-          <Text><Text color="cyan"><Spinner type="dots" /></Text><Text dimColor> ({elapsed}s · thinking)</Text></Text>
+          <>
+            <Text><Text color="cyan"><Spinner type="dots" /></Text><Text dimColor> ({elapsed}s · thinking)</Text></Text>
+            {activity && <Text dimColor>   {activity}</Text>}
+          </>
         ) : (
           <Text><Text color="cyan" bold>❯ </Text><Text>{input}</Text><Text color="gray">▌</Text></Text>
         )}
