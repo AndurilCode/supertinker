@@ -247,7 +247,10 @@ export async function invoke(ctx: ProviderContext): Promise<AgentResult> {
       else if (parsed.result) result = JSON.parse(parsed.result)
       else throw new Error(`Unexpected Claude output shape: ${raw.slice(0, 200)}`)
     } else {
-      result = { output: parsed.result ?? "", choice: "" }
+      // Non-empty marker so PostAgent hooks (e.g. retry) don't misread a
+      // free-form call as a failed sentinel. Persistent-style callers
+      // ignore `choice` downstream.
+      result = { output: parsed.result ?? "", choice: "ok" }
     }
     result.metadata = { sessionId: parsed.session_id ?? sessionId, streaming: false }
     // Persist session for future turns
