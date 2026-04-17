@@ -6,7 +6,7 @@
  */
 
 import { appendFileSync, existsSync, mkdirSync, readdirSync,
-         readFileSync, writeFileSync }                          from "fs"
+         readFileSync, statSync, writeFileSync }                from "fs"
 import { join, resolve }                                        from "path"
 import { homedir }                                              from "os"
 import { createRequire }                                        from "module"
@@ -71,6 +71,8 @@ export interface PausedState {
 
 export interface StorageAdapter {
   createRun(runId: string): Promise<string>
+  runDir(runId: string): string
+  listRuns(opts?: { sinceMs?: number }): Promise<Array<{ runId: string; mtimeMs: number }>>
   saveContext(runDir: string, context: Context): Promise<void>
   loadContext(runDir: string): Promise<Context>
   savePause(runDir: string, state: PausedState): Promise<void>
@@ -95,6 +97,30 @@ export const filesystemStorage: StorageAdapter = {
     const dir = join(RUN_ROOT, runId)
     mkdirSync(dir, { recursive: true })
     return dir
+  },
+  runDir(runId) {
+    // Subworkflow runs are created at <parent>/sub-<child> (see the subworkflow
+    // branch in executeNode), but users resume them with --run <parent>/<child>.
+    // Translate that convention here so callers never need to know about it.
+    const direct = join(RUN_ROOT, runId)
+    if (existsSync(direct)) return direct
+    if (runId.includes("/")) {
+      const [head, ...rest] = runId.split("/")
+      const subPath = join(RUN_ROOT, head, `sub-${rest.join("/")}`)
+      if (existsSync(subPath)) return subPath
+    }
+    return direct
+  },
+  async listRuns({ sinceMs = 0 } = {}) {
+    if (!existsSync(RUN_ROOT)) return []
+    const out: Array<{ runId: string; mtimeMs: number }> = []
+    for (const name of readdirSync(RUN_ROOT)) {
+      try {
+        const s = statSync(join(RUN_ROOT, name))
+        if (s.isDirectory() && s.mtimeMs >= sinceMs) out.push({ runId: name, mtimeMs: s.mtimeMs })
+      } catch {}
+    }
+    return out
   },
   async saveContext(runDir, context) {
     writeFileSync(join(runDir, "context.json"), JSON.stringify(context, null, 2))
@@ -879,7 +905,7 @@ export async function run({ workflow, initialContext = {}, overrides = {} }: { w
 
 export async function resume({ workflow, runId, choice, overrides = {} }: { workflow: Workflow; runId: string; choice: string; overrides?: ProviderOverrides }): Promise<void> {
   const storage = await loadStorage()
-  const runDir  = join(RUN_ROOT, runId)
+  const runDir  = storage.runDir(runId)
   if (!await storage.pauseExists(runDir)) throw new Error(`No paused state for run: ${runId}`)
 
   const paused   = await storage.loadPause(runDir)

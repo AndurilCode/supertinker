@@ -14,12 +14,12 @@
  *   tsx cli.ts plugins update
  */
 
-import { existsSync, mkdirSync, readFileSync, copyFileSync, unlinkSync, writeFileSync, readdirSync, statSync, symlinkSync } from "fs"
+import { existsSync, mkdirSync, readFileSync, copyFileSync, unlinkSync, writeFileSync, readdirSync, statSync } from "fs"
 import { spawnSync, execSync }                        from "child_process"
 import { join, resolve }                              from "path"
 import { homedir }                                    from "os"
 import { run, resume, buildCatalog, buildNodeCatalog, loadStorage, loadHooks } from "./supertinker.js"
-import type { Context, ProviderOverrides }                   from "./supertinker.js"
+import type { Context, ProviderOverrides, StorageAdapter }    from "./supertinker.js"
 import { renderDashboard } from "./dashboard.js"
 import type { TranscriptMapper } from "./display-protocol.js"
 
@@ -29,23 +29,14 @@ function shellQuote(a: string): string {
   return `'${a.replace(/'/g, `'\\''`)}'`
 }
 
-async function discoverRunId(sinceMs: number, timeoutMs = 4000): Promise<string | null> {
-  const root = "/tmp/orchestrator"
+async function discoverRunId(storage: StorageAdapter, sinceMs: number, timeoutMs = 4000): Promise<string | null> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    try {
-      const candidates: Array<{ name: string; t: number }> = []
-      for (const name of readdirSync(root)) {
-        try {
-          const s = statSync(join(root, name))
-          if (s.isDirectory() && s.mtimeMs >= sinceMs) candidates.push({ name, t: s.mtimeMs })
-        } catch {}
-      }
-      if (candidates.length > 0) {
-        candidates.sort((a, b) => b.t - a.t)
-        return candidates[0].name
-      }
-    } catch {}
+    const runs = await storage.listRuns({ sinceMs })
+    if (runs.length > 0) {
+      runs.sort((a, b) => b.mtimeMs - a.mtimeMs)
+      return runs[0].runId
+    }
     await new Promise(r => setTimeout(r, 50))
   }
   return null
@@ -53,6 +44,7 @@ async function discoverRunId(sinceMs: number, timeoutMs = 4000): Promise<string 
 
 async function ensureTmux(): Promise<boolean> {
   if (!!process.env.TMUX) return true
+  const storage = await loadStorage()
   const sess = `supertinker-${Date.now()}`
   const cmd  = process.argv.map(shellQuote).join(" ")
   const startedAt = Date.now()
@@ -72,17 +64,17 @@ async function ensureTmux(): Promise<boolean> {
     return true
   }
 
-  const runId = await discoverRunId(startedAt)
+  const runId = await discoverRunId(storage, startedAt)
 
   console.log(`supertinker running in tmux session: ${sess}`)
   console.log(`  attach:  tmux attach -t ${sess}`)
   console.log(`  kill:    tmux kill-session -t ${sess}`)
   if (runId) {
     console.log(`  runId:   ${runId}`)
-    console.log(`  logs:    tail -f /tmp/orchestrator/${runId}/orchestrator.log`)
+    console.log(`  logs:    tail -f ${storage.runDir(runId)}/orchestrator.log`)
     console.log(`  status:  ${process.argv[0]} ${process.argv[1]} status --run ${runId}`)
   } else {
-    console.log(`  logs:    tail -f $(ls -td /tmp/orchestrator/*/ | head -1)/orchestrator.log`)
+    console.log(`  (run not yet detected — check the tmux session)`)
   }
   return false
 }
@@ -628,18 +620,15 @@ const runCmd: CommandPlugin = {
     // (claude CLI) from writing to /dev/tty, which breaks Ink's rendering.
     process.stdout.write = (() => true) as any
     const prefix = workflow.id
-    const orchestratorDir = "/tmp/orchestrator"
+    const sinceMs = Date.now()
 
     const discoverRunDir = (): Promise<string> => new Promise((res) => {
-      const before = new Set(existsSync(orchestratorDir) ? readdirSync(orchestratorDir) : [])
-      const interval = setInterval(() => {
-        if (!existsSync(orchestratorDir)) return
-        for (const entry of readdirSync(orchestratorDir)) {
-          if (!before.has(entry) && entry.startsWith(prefix)) {
-            clearInterval(interval)
-            res(join(orchestratorDir, entry))
-            return
-          }
+      const interval = setInterval(async () => {
+        const runs = await storage.listRuns({ sinceMs })
+        const match = runs.find(r => r.runId.startsWith(prefix))
+        if (match) {
+          clearInterval(interval)
+          res(storage.runDir(match.runId))
         }
       }, 100)
     })
@@ -669,7 +658,7 @@ const resumeCmd: CommandPlugin = {
     const storage = await loadStorage()
     const { workflow } = await import(await storage.resolveWorkflow(workflowRef) ?? resolve(workflowRef))
 
-    const runDir = join("/tmp/orchestrator", runId)
+    const runDir = storage.runDir(runId)
 
     if (quiet) {
       await resume({ workflow, runId, choice, overrides })
@@ -693,7 +682,7 @@ const statusCmd: CommandPlugin = {
     const runId = get("--run")
     if (!runId) { console.error("Usage: supertinker status --run <runId>"); process.exit(1) }
     const storage = await loadStorage()
-    const runDir = join("/tmp/orchestrator", runId)
+    const runDir = storage.runDir(runId)
     if (!existsSync(runDir)) { console.error(`Run directory not found: ${runDir}`); process.exit(1) }
 
     // ── Discover sub-workflows
@@ -864,8 +853,8 @@ const listCmd: CommandPlugin = {
   usage: "list [--hooks]",
   async handler(args) {
     if (args.includes("--hooks")) {
-      const tmpDir = join("/tmp/orchestrator", "hook-list")
-      mkdirSync(tmpDir, { recursive: true })
+      const storage = await loadStorage()
+      const tmpDir = await storage.createRun("hook-list")
       const hooks = await loadHooks(tmpDir)
       const entries: string[] = []
       const seen = new Set<string>()
@@ -984,23 +973,6 @@ Examples:
 const cmd = process.argv[2]
 const isQuiet = process.argv.includes("--quiet")
 const isDashboard = false // TODO: re-enable when dashboard is stable — was: (cmd === "run" || cmd === "resume") && !isQuiet
-
-// Sub-workflow resume: bridge the "sub-" directory convention before tmux forks.
-// The core's resume() looks at /tmp/orchestrator/<runId> but sub-workflows live
-// at /tmp/orchestrator/<parent>/sub-<name>. Create a symlink so the core finds it.
-if (cmd === "resume") {
-  const resumeRunId = (() => { const i = process.argv.indexOf("--run"); return i >= 0 ? process.argv[i + 1] : null })()
-  if (resumeRunId?.includes("/")) {
-    const expectedDir = join("/tmp/orchestrator", resumeRunId)
-    if (!existsSync(expectedDir)) {
-      const parts = resumeRunId.split("/")
-      const subDir = join("/tmp/orchestrator", parts[0], `sub-${parts.slice(1).join("/")}`)
-      if (existsSync(subDir)) {
-        try { symlinkSync(subDir, expectedDir) } catch {}
-      }
-    }
-  }
-}
 
 // Only `run` and `resume` need tmux for agent panes. Everything else (including
 // command plugins, status, list, plugins, help) runs directly in the foreground.
