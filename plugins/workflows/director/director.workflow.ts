@@ -13,26 +13,31 @@ export const workflow: Workflow = {
         id:    "director",
         type:  "persistent",
         agent: "claude",
-        // Keep the context slice focused — the agent keeps its own history
-        // via the Claude session sidecar, so we don't need to stuff everything.
-        slice:   ["event", "director"],
+        // `cwd` is the folder the user ran supertinker from — that's the
+        // workspace this agent manages. `event` / `director` carry the
+        // latest user message and the prior reply.
+        slice:   ["event", "director", "cwd"],
         options: { event: "director" },    // loop back on resume
         timeout: 900_000,                   // 15 min — creating + running workflows takes time
         instruction: [
           "You are a director agent running inside supertinker.",
           "Each turn, the latest user request arrives as an 'event' context section. Your prior reply (if any) is in the 'director' section.",
+          "The 'cwd' section holds the absolute path of the workspace you manage — the directory the user invoked supertinker from.",
+          "",
+          "Your process cwd is an isolated sandbox, not the workspace. Always use the 'cwd' value as an absolute path prefix for project work, or cd into it in Bash.",
+          "",
           "You have Bash, Read, Write, Edit, Glob, Grep tools pre-approved.",
           "",
-          "Supertinker project directory: /Users/gpavanello/Repositories/supertinker",
+          "To CREATE a workflow: write <cwd>/.supertinker/workflows/<id>.workflow.ts. Copy the structure of an existing workflow — list them first with `supertinker list --workflows` and read one for reference.",
           "",
-          "To CREATE a workflow: write .supertinker/workflows/<id>.workflow.ts. Copy the structure of an existing one like .supertinker/workflows/meta.workflow.ts (use Read).",
+          "To LAUNCH a workflow (non-blocking, so you can reply):",
+          "  cd <cwd> && supertinker run --workflow <id> --prompt <text> --quiet > /tmp/orchestrator/last-launch.log 2>&1 &",
           "",
-          "To LAUNCH a workflow (non-blocking, so you can reply): run in Bash:",
-          "  cd /Users/gpavanello/Repositories/supertinker && bun cli.ts run --workflow <id> --prompt <text> --quiet > /tmp/orchestrator/last-launch.log 2>&1 &",
+          "To INSPECT a run: supertinker status --run <runId>  |  cat /tmp/orchestrator/<runId>/context.json",
           "",
-          "To INSPECT: bun cli.ts status --run <runId>  |  cat /tmp/orchestrator/<runId>/context.json",
+          "To LIST workflows: supertinker list --workflows   (from inside <cwd>)",
           "",
-          "To LIST: bun cli.ts list --workflows",
+          "If `supertinker` is not on PATH, fall back to invoking it the way the user launched this chat (inspect `ps` for the running chat command).",
           "",
           "Respond conversationally. Do the work the user asks, then summarize what you did.",
         ].join("\n"),
