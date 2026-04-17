@@ -25,20 +25,66 @@ import type { TranscriptMapper } from "./display-protocol.js"
 
 // ─── TMUX AUTO-LAUNCH
 
-function ensureTmux(): boolean {
+function shellQuote(a: string): string {
+  return `'${a.replace(/'/g, `'\\''`)}'`
+}
+
+async function discoverRunId(sinceMs: number, timeoutMs = 4000): Promise<string | null> {
+  const root = "/tmp/orchestrator"
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      const candidates: Array<{ name: string; t: number }> = []
+      for (const name of readdirSync(root)) {
+        try {
+          const s = statSync(join(root, name))
+          if (s.isDirectory() && s.mtimeMs >= sinceMs) candidates.push({ name, t: s.mtimeMs })
+        } catch {}
+      }
+      if (candidates.length > 0) {
+        candidates.sort((a, b) => b.t - a.t)
+        return candidates[0].name
+      }
+    } catch {}
+    await new Promise(r => setTimeout(r, 50))
+  }
+  return null
+}
+
+async function ensureTmux(): Promise<boolean> {
   if (!!process.env.TMUX) return true
-  const args = process.argv.slice(1).map(a => `'${a}'`).join(" ")
   const sess = `supertinker-${Date.now()}`
-  try {
-    spawnSync("tmux", ["new-session", "-d", "-s", sess, `${process.argv[0]} ${args}`], { stdio: "ignore" })
-    console.log(`supertinker running in tmux session: ${sess}`)
-    console.log(`  attach:  tmux attach -t ${sess}`)
-    console.log(`  kill:    tmux kill-session -t ${sess}`)
-    return false
-  } catch {
+  const cmd  = process.argv.map(shellQuote).join(" ")
+  const startedAt = Date.now()
+
+  // Create an empty session first so the shell persists after the command exits;
+  // otherwise the session dies the moment the workflow pauses/finishes and the
+  // user can no longer attach to inspect what happened.
+  const create = spawnSync("tmux", ["new-session", "-d", "-s", sess], { stdio: "ignore" })
+  if (create.error || create.status !== 0) {
     console.log("(tmux not available — running without panes)")
     return true
   }
+  const send = spawnSync("tmux", ["send-keys", "-t", sess, cmd, "Enter"], { stdio: "ignore" })
+  if (send.error || send.status !== 0) {
+    spawnSync("tmux", ["kill-session", "-t", sess], { stdio: "ignore" })
+    console.log("(tmux not available — running without panes)")
+    return true
+  }
+
+  const runId = await discoverRunId(startedAt)
+
+  console.log(`supertinker running in tmux session: ${sess}`)
+  console.log(`  attach:  tmux attach -t ${sess}`)
+  console.log(`  kill:    tmux kill-session -t ${sess}`)
+  if (runId) {
+    console.log(`  runId:   ${runId}`)
+    console.log(`  logs:    tail -f /tmp/orchestrator/${runId}/orchestrator.log`)
+    console.log(`  status:  ${process.argv[0]} ${process.argv[1]} status --run ${runId}`)
+  } else {
+    console.log(`  logs:    tail -f $(ls -td /tmp/orchestrator/*/ | head -1)/orchestrator.log`)
+  }
+  return false
 }
 
 // ─── PLUGIN TYPES
@@ -959,5 +1005,5 @@ if (cmd === "resume") {
 // Only `run` and `resume` need tmux for agent panes. Everything else (including
 // command plugins, status, list, plugins, help) runs directly in the foreground.
 const TMUX_COMMANDS = new Set(["run", "resume"])
-if (!cmd || !TMUX_COMMANDS.has(cmd) || isDashboard || isQuiet) cli().catch(err => { console.error(err); process.exit(1) })
-else if (ensureTmux()) cli().catch(err => { console.error(err); process.exit(1) })
+const runInline = !cmd || !TMUX_COMMANDS.has(cmd) || isDashboard || isQuiet || await ensureTmux()
+if (runInline) cli().catch(err => { console.error(err); process.exit(1) })
