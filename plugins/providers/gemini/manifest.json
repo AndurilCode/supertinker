@@ -1,0 +1,7 @@
+{
+  "name": "gemini",
+  "type": "provider",
+  "description": "Google Gemini CLI provider — invokes `gemini -p` non-interactively with sentinel-based choice parsing",
+  "files": ["gemini.ts"],
+  "version": "1.0.0"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "codex",
+  "type": "provider",
+  "description": "OpenAI Codex CLI provider — invokes `codex exec` non-interactively with sentinel-based choice parsing",
+  "files": ["codex.ts"],
+  "version": "1.0.0"
+}
