@@ -323,57 +323,20 @@ Loaded lazily by name from the registry's `command` field. `command: "my-provide
 <details>
 <summary><strong>Writing a custom node type</strong></summary>
 
-Place a `.ts` or `.js` file in `.supertinker/nodes/`, `~/.supertinker/nodes/`, or ship it as a plugin under `plugins/nodes/<name>/`. Export a `NodeTypeDefinition`:
+Place a `.ts` or `.js` file in `.supertinker/nodes/`, `~/.supertinker/nodes/`, or ship it as a plugin under `plugins/nodes/<name>/`. Export a `NodeTypeDefinition` with a unique `type` string, an optional `schema` (`requires`/`optional`/`example`), an optional `validate(node, graph)` pre-flight, and an `execute(ctx)` body.
 
-```typescript
-import type { NodeTypeDefinition } from "../supertinker"
+The `ctx` passed to `execute` exposes the stable surface custom nodes rely on: `context`, `slice()`, `render()`, `executeNode()`, `runAgent()`, `invokeAgent()`, `emitHook()`, `writePause()`, `errorFallback()`, `resolveFallback()`, `saveContext()`, and `log()`. Node plugins that invoke agents should prefer `runAgent(node)` so the full `PreAgent → PreProvider → PostAgent` hook chain (and its directives) fires exactly as for standard nodes — a `{ redirected: true }` result means a hook already moved execution elsewhere.
 
-export const node: NodeTypeDefinition = {
-  type: "script",                     // must not collide with a built-in
-  description: "Runs a shell command; stdout becomes the node's output",
-  schema: {
-    requires: ["instruction", "options"],
-    optional: ["stdin", "cwd", "slice", "timeout"],
-  },
-  validate: (n) => n.options?.done ? null : `"${n.id}" requires options.done`,
-  execute: async (ctx) => {
-    // ctx gives you: node, context, slice(), render(), runAgent(), invokeAgent(),
-    // executeNode(), emitHook(), writePause(), errorFallback(), saveContext(), log()
-    ctx.context[ctx.node.id] = "result"
-    await ctx.saveContext()
-    await ctx.executeNode(ctx.node.options!.done, ctx.node.id)
-  },
-}
-```
-
-Node plugins that invoke agents should use `ctx.runAgent(node)` instead of `ctx.invokeAgent(...)` so the full `PreAgent → PreProvider → PostAgent` hook chain (and its directives) fires exactly as for standard nodes. A `redirected: true` result means a hook already moved execution elsewhere.
-
-Plugin search order: project → user → built-in, first match wins. Built-in types (`fork`, `join`, `done`, `failed`, `paused`, `subworkflow`) cannot be shadowed.
+**Search order:** project → user → built-in, first match wins. Built-in types (`fork`, `join`, `done`, `failed`, `paused`, `subworkflow`) cannot be shadowed.
 
 </details>
 
 <details>
 <summary><strong>Writing a command plugin</strong></summary>
 
-Command plugins extend the CLI itself — everything after `supertinker <name> …` is routed to your handler. Built-in commands (`run`, `resume`, `status`, `list`, `plugins`) implement the same contract.
+Command plugins extend the CLI itself — everything after `supertinker <name> …` is routed to your handler, and the command shows up in `supertinker --help` automatically. Built-in commands (`run`, `resume`, `status`, `list`, `plugins`) implement the same `CommandPlugin` contract.
 
-Place a `.ts` or `.js` file in `.supertinker/commands/` or `~/.supertinker/commands/`, or ship it as a plugin under `plugins/commands/<name>/`. Export a `CommandPlugin`:
-
-```typescript
-import type { CommandPlugin } from "../cli"
-
-export const command: CommandPlugin = {
-  name: "hello",
-  description: "Print a greeting",
-  usage: "supertinker hello [--name <who>]",
-  handler: async (args, get) => {
-    const who = get("name") ?? "world"
-    process.stdout.write(`hello, ${who}\n`)
-  },
-}
-```
-
-`get(flag)` resolves `--flag value` / `--flag=value` from the argument list. Discovered commands appear in `supertinker --help` automatically.
+Place a `.ts` or `.js` file in `.supertinker/commands/`, `~/.supertinker/commands/`, or ship it as a plugin under `plugins/commands/<name>/`. Export a `CommandPlugin` with `name`, `description`, optional `usage`, and a `handler(args, get)` where `get(flag)` resolves `--flag value` / `--flag=value` from the argument list.
 
 </details>
 
