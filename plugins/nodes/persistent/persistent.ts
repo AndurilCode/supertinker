@@ -20,8 +20,6 @@
  * that terminates the loop).
  */
 
-import { existsSync, mkdirSync } from "fs"
-import { join }                  from "path"
 import type { NodeTypeDefinition } from "../../../supertinker"
 
 export const node: NodeTypeDefinition = {
@@ -67,19 +65,12 @@ export const node: NodeTypeDefinition = {
       return
     }
 
-    // Per-run sandbox cwd (unless the workflow sets node.cwd explicitly).
-    // Claude Code namespaces memory by cwd — if we just use the project dir,
-    // every agent turn auto-loads any past Claude Code conversation in that
-    // project. Pointing the subprocess at a fresh per-run directory gives
-    // the agent a clean slate. The agent still reaches the real project
-    // via absolute paths in its instructions / Bash tool.
-    const sandbox = ctx.node.cwd ?? join(ctx.runDir, "sandbox")
-    if (!ctx.node.cwd && !existsSync(sandbox)) mkdirSync(sandbox, { recursive: true })
-
     // Strip options for the agent call so no choice sentinel is required —
     // persistent agents produce free-form output. The options map stays on
-    // the node for the resume path to use.
-    const nodeForAgent = { ...ctx.node, options: undefined, cwd: sandbox }
+    // the node for the resume path to use. cwd defaults to the orchestrator's
+    // process.cwd() (the directory the user launched supertinker from) so
+    // the agent sees the real workspace; workflows can override via node.cwd.
+    const nodeForAgent = { ...ctx.node, options: undefined }
 
     const piped = await ctx.runAgent(nodeForAgent)
     if ("redirected" in piped) return
