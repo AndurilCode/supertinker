@@ -80,9 +80,14 @@ function renderMarkdown(md: string): string {
 // ─── Active-runs scan ─────────────────────────────────────────────────────
 interface RunStatus {
   runId: string; currentNode: string
-  status: "paused" | "running" | "done" | "failed"
+  status: "paused" | "running" | "stale" | "done" | "failed"
   mtimeMs: number; isCurrent: boolean
 }
+
+// A run is only truly "running" if its log has been touched recently.
+// Processes killed externally leave behind logs with a last START/INVOKE
+// but no DONE/FAILED — they'd stay "running" forever without this check.
+const STALE_MS = 120_000   // 2 minutes of log inactivity → stale
 
 function classifyRun(runDir: string, runId: string, currentRunId: string): RunStatus | null {
   try {
@@ -98,13 +103,16 @@ function classifyRun(runDir: string, runId: string, currentRunId: string): RunSt
     const log = readFileSync(logPath, "utf8")
     if (/^\[[^\]]+\]\s+DONE\s+graph/m.test(log))   return { runId, currentNode: "done",   status: "done",   mtimeMs, isCurrent: runId === currentRunId }
     if (/^\[[^\]]+\]\s+FAILED\s+graph/m.test(log)) return { runId, currentNode: "failed", status: "failed", mtimeMs, isCurrent: runId === currentRunId }
+
+    const logMtime = statSync(logPath).mtimeMs
     const lines = log.trim().split(/\r?\n/)
     let currentNode = "?"
     for (let i = lines.length - 1; i >= 0; i--) {
       const m = lines[i].match(/\]\s+(?:START|RESUME|INVOKE)\s+(\S+)/)
       if (m) { currentNode = m[1]; break }
     }
-    return { runId, currentNode, status: "running", mtimeMs, isCurrent: runId === currentRunId }
+    const status: RunStatus["status"] = (Date.now() - logMtime < STALE_MS) ? "running" : "stale"
+    return { runId, currentNode, status, mtimeMs: logMtime, isCurrent: runId === currentRunId }
   } catch { return null }
 }
 
@@ -118,6 +126,9 @@ function scanActiveRuns(currentRunId: string): RunStatus[] {
       if (s) entries.push(s)
     }
   } catch { return [] }
+  // Keep only actionable runs: the current chat run plus anything paused or
+  // genuinely running. Stale/done/failed are hidden — they clutter the footer
+  // and aren't something the user can do anything about from here.
   const active = entries.filter(e => e.isCurrent || e.status === "paused" || e.status === "running")
   active.sort((a, b) => {
     if (a.isCurrent && !b.isCurrent) return -1
@@ -131,7 +142,10 @@ function scanActiveRuns(currentRunId: string): RunStatus[] {
 function Footer({ runs }: { runs: RunStatus[] }) {
   if (runs.length === 0) return null
   const statusColor = (s: RunStatus["status"]): string =>
-    s === "paused" ? "yellow" : s === "running" ? "green" : s === "failed" ? "red" : "gray"
+    s === "paused"  ? "yellow" :
+    s === "running" ? "green"  :
+    s === "failed"  ? "red"    :
+    s === "stale"   ? "gray"   : "gray"
 
   return (
     <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1}>
