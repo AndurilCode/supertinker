@@ -184,6 +184,86 @@ function writeState(runDir: string, state: any): void {
   writeFileSync(join(runDir, "state.json"), JSON.stringify(state, null, 2))
 }
 
+// ─── Active runs footer ────────────────────────────────────────────────────
+// Scans /tmp/orchestrator/ for runs that are still in play and formats a
+// compact status block: runId, current node, and derived status. Skips
+// terminal runs (done/failed) so the footer stays useful.
+
+interface RunStatus {
+  runId:       string
+  currentNode: string
+  status:      "paused" | "running" | "done" | "failed" | "unknown"
+  mtimeMs:     number
+  isCurrent:   boolean
+}
+
+function classifyRun(runDir: string, runId: string, currentRunId: string): RunStatus | null {
+  try {
+    const mtimeMs = statSync(runDir).mtimeMs
+    // Paused runs carry a state.json — that's the authoritative "waiting here" marker
+    if (existsSync(join(runDir, "state.json"))) {
+      try {
+        const s = JSON.parse(readFileSync(join(runDir, "state.json"), "utf8"))
+        return { runId, currentNode: s.nodeId ?? "?", status: "paused", mtimeMs, isCurrent: runId === currentRunId }
+      } catch {}
+    }
+    // Otherwise parse the log for the latest node-level event
+    const logPath = join(runDir, "orchestrator.log")
+    if (!existsSync(logPath)) return null
+    const log = readFileSync(logPath, "utf8")
+    if (/^\[[^\]]+\]\s+DONE\s+graph/m.test(log))   return { runId, currentNode: "done",   status: "done",   mtimeMs, isCurrent: runId === currentRunId }
+    if (/^\[[^\]]+\]\s+FAILED\s+graph/m.test(log)) return { runId, currentNode: "failed", status: "failed", mtimeMs, isCurrent: runId === currentRunId }
+    // Walk backwards: find the most recent START/RESUME line
+    const lines = log.trim().split(/\r?\n/)
+    let currentNode = "?"
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const m = lines[i].match(/\]\s+(?:START|RESUME|INVOKE)\s+(\S+)/)
+      if (m) { currentNode = m[1]; break }
+    }
+    return { runId, currentNode, status: "running", mtimeMs, isCurrent: runId === currentRunId }
+  } catch { return null }
+}
+
+function formatFooter(currentRunId: string): string {
+  let entries: RunStatus[] = []
+  try {
+    const names = readdirSync(RUN_ROOT)
+    for (const n of names) {
+      const dir = join(RUN_ROOT, n)
+      try { if (!statSync(dir).isDirectory()) continue } catch { continue }
+      const s = classifyRun(dir, n, currentRunId)
+      if (s) entries.push(s)
+    }
+  } catch { return "" }
+
+  // Keep the current run + anything still running/paused. Sort: current
+  // first, then by mtime desc. Cap at 8 rows so the footer never dominates.
+  const active = entries.filter(e => e.isCurrent || e.status === "paused" || e.status === "running")
+  active.sort((a, b) => {
+    if (a.isCurrent && !b.isCurrent) return -1
+    if (!a.isCurrent && b.isCurrent) return 1
+    return b.mtimeMs - a.mtimeMs
+  })
+  const shown = active.slice(0, 8)
+  if (shown.length === 0) return ""
+
+  const rows = shown.map(e => {
+    const statusColor =
+      e.status === "paused"  ? C.yellow :
+      e.status === "running" ? C.green  :
+      e.status === "failed"  ? C.red    :
+      e.status === "done"    ? C.dim    : C.gray
+    const marker = e.isCurrent ? `${C.cyan}●${C.reset}` : ` `
+    const statusBadge = `${statusColor}${e.status.padEnd(7)}${C.reset}`
+    return `  ${marker} ${statusBadge} ${C.cyan}${e.runId}${C.reset} ${C.dim}@${e.currentNode}${C.reset}`
+  })
+
+  const hiddenCount = active.length - shown.length
+  const header = `${C.gray}─── runs (${active.length}) ${"─".repeat(30)}${C.reset}`
+  const footer = hiddenCount > 0 ? `  ${C.dim}…and ${hiddenCount} more${C.reset}` : null
+  return [header, ...rows, ...(footer ? [footer] : [])].join("\n")
+}
+
 export const command: CommandPlugin = {
   name: "chat",
   description: "interactive REPL for persistent-agent workflows",
@@ -222,8 +302,14 @@ export const command: CommandPlugin = {
 
     // Initial greeting
     const initial = readState(runDir)?.context?.[replyKey]
-    process.stdout.write(`\n${C.dim}chat: connected to ${C.reset}${C.cyan}${runId}${C.reset}${C.dim}  (type /exit to quit, /run for id, /raw for context)${C.reset}\n`)
+    process.stdout.write(`\n${C.dim}chat: connected to ${C.reset}${C.cyan}${runId}${C.reset}${C.dim}  (type /help for commands)${C.reset}\n`)
     if (initial) process.stdout.write(`\n${renderMarkdown(initial)}\n`)
+
+    const printFooter = (): void => {
+      const f = formatFooter(runId!)
+      if (f) process.stdout.write(`\n${f}\n`)
+    }
+    printFooter()
 
     // ── REPL ──────────────────────────────────────────────────────────
     const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true })
@@ -241,6 +327,7 @@ export const command: CommandPlugin = {
       } catch (err) {
         process.stdout.write(`\n${C.red}(failed to read state: ${err})${C.reset}\n`)
       }
+      printFooter()
     }
 
     rl.on("line", async (raw) => {
@@ -259,19 +346,21 @@ export const command: CommandPlugin = {
         try { process.stdout.write(`${C.dim}${readFileSync(join(runDir, "context.json"), "utf8")}${C.reset}\n`) } catch {}
         rl.prompt(); return
       }
-      if (line === "/tail")  {
+      if (line === "/tail")   {
         try {
           const lines = readFileSync(join(runDir, "orchestrator.log"), "utf8").trim().split("\n")
           process.stdout.write(`${C.dim}${lines.slice(-20).join("\n")}${C.reset}\n`)
         } catch {}
         rl.prompt(); return
       }
-      if (line === "/help")  {
+      if (line === "/status") { printFooter(); rl.prompt(); return }
+      if (line === "/help")   {
         process.stdout.write(
           `${C.dim}commands: ${C.reset}${C.cyan}/exit${C.reset} ${C.dim}leave · ${C.reset}` +
           `${C.cyan}/run${C.reset} ${C.dim}print runId · ${C.reset}` +
           `${C.cyan}/raw${C.reset} ${C.dim}dump context · ${C.reset}` +
-          `${C.cyan}/tail${C.reset} ${C.dim}last 20 log lines${C.reset}\n`,
+          `${C.cyan}/tail${C.reset} ${C.dim}last 20 log lines · ${C.reset}` +
+          `${C.cyan}/status${C.reset} ${C.dim}refresh active runs${C.reset}\n`,
         )
         rl.prompt(); return
       }
