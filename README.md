@@ -34,7 +34,9 @@ Runs anywhere Node.js runs: laptop, CI runner, dev container. No server, no data
 
 - **Graph-based workflows** — DAGs with fan-out, fan-in, review loops, label-based branching
 - **Multi-agent** — `claude` CLI, `copilot` CLI, or drop-in custom providers
-- **Plugin system** — install, uninstall, update hooks/providers/workflows/storage via CLI
+- **Plugin system** — six extension points (hook, provider, workflow, storage, **node**, **command**) installable via CLI
+- **Pluggable node types** — ship custom node types (`script`, `choice`, …) alongside the built-ins
+- **Pluggable CLI commands** — extend the `cli` surface with your own subcommands via the `CommandPlugin` contract
 - **Meta-workflow** — an architect agent designs workflows at runtime, then executes them
 - **Subworkflows** — embed one workflow inside another as a first-class node type
 - **Fork / join** — fan out to N branches concurrently, synchronize at a join node
@@ -43,6 +45,7 @@ Runs anywhere Node.js runs: laptop, CI runner, dev container. No server, no data
 - **Guardrails** — pre/post checks (JS expressions or TypeScript functions); retry once, then pause
 - **Template validation** — pre-flight check that `[nodeId]` references in instructions point to real nodes
 - **Context slicing** — nodes declare which context keys the agent sees, keeping token budgets predictable
+- **Output memoization** — opt-in `context-cache` hook skips re-execution when a node's inputs haven't changed
 - **Structured logging** — human-readable `orchestrator.log` + machine-readable NDJSON event stream
 - **Tmux integration** — auto-spawns panes to tail orchestrator and per-agent logs
 - **Zero dependencies** — only Node.js built-ins: `fs`, `child_process`, `path`, `os`
@@ -124,8 +127,17 @@ Plugins are the primary extension mechanism. Each lives in `plugins/<type>/<name
 | **fork-worktree** | hook | Git worktree isolation for parallel fork branches |
 | **tmux-panes** | hook | Opens tmux panes for orchestrator and per-agent log tailing |
 | **validate-templates** | hook | Aborts run if instructions reference undefined `[nodeId]` variables |
+| **context-cache** | hook | Content-addressable memoization — skips re-execution when cached output exists |
+| **metrics** | hook | Per-agent and per-run token usage, cost, and duration from provider logs |
+| **notify** | hook | macOS system notifications for agent completion, pauses, and workflow end |
+| **sanitize-json** | hook | Strips markdown code fences from agent output that should be raw JSON |
+| **user-pause** | hook | Pause on user request — checks for a `pause-requested` file on `PreAgent` |
 | **copilot** | provider | GitHub Copilot CLI provider with sentinel-based choice parsing |
 | **meta** | workflow | Architect agent designs a workflow, then the orchestrator executes it |
+| **code-review** | workflow | Multi-lens code review: quality, security, and project rules — inline comments + summary |
+| **script** | node | Runs a shell command; stdout becomes the node's output |
+| **choice** | node | Runs a shell command; the first line of stdout selects the next branch |
+| **scheduler** | command | Schedule supertinker workflows via launchd (macOS) |
 | **custom** | storage | Project-local workflow persistence to `.supertinker/workflows/` |
 
 ### Manage plugins
@@ -228,6 +240,7 @@ export const workflow: Workflow = {
 | `"done"` | Terminal — success. |
 | `"paused"` | Terminal — paused, awaiting human input. |
 | `"failed"` | Terminal — unrecoverable failure. |
+| *custom* | Any `type` registered by a node plugin in `<search>/nodes/<name>.ts` (e.g. `"script"`, `"choice"`). |
 
 ### Context references
 
@@ -279,11 +292,13 @@ export const hook: Hook = {
 }
 ```
 
-**Directives:** `continue` (all events) · `skip` (PreAgent, PreProvider) · `pause` (PreAgent, PreProvider, PostAgent, GuardrailFail, SubworkflowStart) · `redirect` (PreAgent, PreProvider, PostAgent) · `abort` (all events)
+**Directives:** `continue` (all events) · `skip` (PreAgent, PreProvider) · `pause` (PreAgent, PreProvider, PostAgent, GuardrailFail, SubworkflowStart, NodeStart) · `redirect` (PreAgent, PreProvider, PostAgent) · `abort` (all events)
 
 When multiple hooks fire, highest-rank wins: `abort > pause > redirect > skip > continue`.
 
-**Events:** `RunStart` · `RunEnd` · `PreAgent` · `PreProvider` · `PostAgent` · `Paused` · `Resumed` · `ForkStart` · `ForkJoin` · `GuardrailFail` · `SubworkflowStart` · `SubworkflowEnd` · `Error`
+**Events:** `RunStart` · `RunEnd` · `NodeStart` · `NodeEnd` · `PreAgent` · `PreProvider` · `PostAgent` · `Paused` · `Resumed` · `ForkStart` · `ForkJoin` · `GuardrailFail` · `SubworkflowStart` · `SubworkflowEnd` · `Error`
+
+Custom node plugins may also emit arbitrary string event names via `ctx.emitHook(...)`; hooks subscribe to them by listing the same name in their `events` array.
 
 </details>
 
@@ -302,6 +317,26 @@ export async function invoke(ctx: {
 ```
 
 Loaded lazily by name from the registry's `command` field. `command: "my-provider"` loads `providers/my-provider.ts`.
+
+</details>
+
+<details>
+<summary><strong>Writing a custom node type</strong></summary>
+
+Place a `.ts` or `.js` file in `.supertinker/nodes/`, `~/.supertinker/nodes/`, or ship it as a plugin under `plugins/nodes/<name>/`. Export a `NodeTypeDefinition` with a unique `type` string, an optional `schema` (`requires`/`optional`/`example`), an optional `validate(node, graph)` pre-flight, and an `execute(ctx)` body.
+
+The `ctx` passed to `execute` exposes the stable surface custom nodes rely on: `context`, `slice()`, `render()`, `executeNode()`, `runAgent()`, `invokeAgent()`, `emitHook()`, `writePause()`, `errorFallback()`, `resolveFallback()`, `saveContext()`, and `log()`. Node plugins that invoke agents should prefer `runAgent(node)` so the full `PreAgent → PreProvider → PostAgent` hook chain (and its directives) fires exactly as for standard nodes — a `{ redirected: true }` result means a hook already moved execution elsewhere.
+
+**Search order:** project → user → built-in, first match wins. Built-in types (`fork`, `join`, `done`, `failed`, `paused`, `subworkflow`) cannot be shadowed.
+
+</details>
+
+<details>
+<summary><strong>Writing a command plugin</strong></summary>
+
+Command plugins extend the CLI itself — everything after `supertinker <name> …` is routed to your handler, and the command shows up in `supertinker --help` automatically. Built-in commands (`run`, `resume`, `status`, `list`, `plugins`) implement the same `CommandPlugin` contract.
+
+Place a `.ts` or `.js` file in `.supertinker/commands/`, `~/.supertinker/commands/`, or ship it as a plugin under `plugins/commands/<name>/`. Export a `CommandPlugin` with `name`, `description`, optional `usage`, and a `handler(args, get)` where `get(flag)` resolves `--flag value` / `--flag=value` from the argument list.
 
 </details>
 
@@ -338,13 +373,16 @@ export const storage: Partial<StorageAdapter> = {
                          │  run() / resume() / catalog   │
                          └──────────────┬───────────────┘
                                         │ loads
-               ┌────────────────────┬───┼────────────────────┐
-               ▼                    ▼   ▼                    ▼
-        Storage adapter      Workflow  Hook index       Provider registry
-        ───────────────      ────────  ──────────       ─────────────────
-        filesystem (default) DAG       13 events        claude (built-in)
-        DB / S3 / custom     Guardrails priority order  copilot (plugin)
-                                       parallel/serial  custom providers
+           ┌──────────┬──────────┬──┼─────────┬──────────┬──────────┐
+           ▼          ▼          ▼  ▼         ▼          ▼          ▼
+     Storage adapter Workflow Hook index  Providers  Node types  Commands
+     ─────────────── ──────── ──────────  ─────────  ──────────  ────────
+     filesystem      DAG      15 events   claude     fork/join   run
+     DB / S3 / …     Guardrails priority  copilot    subworkflow resume
+                              parallel/   custom     script      status
+                              sequential             choice      list
+                                                     custom      plugins
+                                                                 custom
 
                                         │
                                         ▼
@@ -367,13 +405,14 @@ export const storage: Partial<StorageAdapter> = {
 ### Execution model
 
 1. `run()` loads the storage adapter, creates a run directory at `/tmp/orchestrator/<workflowId>-<timestamp>/`
-2. Hooks discovered from all three search paths (project, user, built-in)
+2. Hooks and custom node types discovered from all three search paths (project, user, built-in)
 3. Tmux panes opened for log tailing (when in a tmux session)
-4. Graph starts at `graph.start`. For each standard node:
+4. Graph starts at `graph.start`. Every node arrival fires `NodeStart`; every departure fires `NodeEnd`. For each standard node:
    - Pre-guardrails → `PreAgent` hook → context slicing → `PreProvider` hook → provider CLI spawn → `PostAgent` hook → post-guardrails → follow edge
 5. Fork nodes fan out concurrently; join nodes block until all branches complete
 6. Subworkflow nodes parse a JSON workflow from context, write to disk, execute as nested `run()`
-7. Terminal nodes (`done`, `paused`, `failed`) end the run
+7. Custom node types (script, choice, your own) run via their plugin's `execute()` — same `NodeStart`/`NodeEnd` lifecycle, free to call `runAgent`/`executeNode`/`emitHook` via the passed context
+8. Terminal nodes (`done`, `paused`, `failed`) end the run
 
 ### Run artifacts
 
@@ -395,6 +434,8 @@ The core engine lives in a single file (`supertinker.ts`). **New features should
 - Additional provider plugins (Gemini CLI, OpenAI CLI, local models via `ollama`)
 - Additional workflow plugins (TDD, documentation generation, security review)
 - Additional hook plugins (Slack notifications, cost tracking, rate limiting)
+- Additional node-type plugins (HTTP request, SQL query, file-diff gate)
+- Additional command plugins (dashboards, remote-run dispatchers, scheduling)
 - Custom storage adapter plugins (database-backed, S3, distributed)
 
 Please open an issue before submitting a large pull request.
