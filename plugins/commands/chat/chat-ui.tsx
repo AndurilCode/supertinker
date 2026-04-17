@@ -277,7 +277,18 @@ function Chat({ runId, workflow, choice, contextKey, replyKey, initial }: ChatPr
   )
   const [input, setInput]       = useState("")
   const [thinking, setThinking] = useState(false)
+  const [elapsed, setElapsed]   = useState(0)
   const [runs, setRuns]         = useState<RunStatus[]>(() => scanActiveRuns(runId, sessionStartMs))
+
+  // Tick a 1s counter while thinking so the spinner line reads "(Ns · thinking)".
+  // Reset to zero when we enter thinking and stop ticking when we leave.
+  useEffect(() => {
+    if (!thinking) { setElapsed(0); return }
+    const start = Date.now()
+    setElapsed(0)
+    const t = setInterval(() => setElapsed(Math.floor((Date.now() - start) / 1000)), 1000)
+    return () => clearInterval(t)
+  }, [thinking])
 
   // Refresh active runs every 1s so status flips (paused → running → paused)
   // during a resume are visible while the user waits for a reply.
@@ -450,7 +461,7 @@ function Chat({ runId, workflow, choice, contextKey, replyKey, initial }: ChatPr
 
       <Box marginTop={1} marginBottom={1}>
         {thinking ? (
-          <Text><Text color="cyan"><Spinner type="dots" /></Text><Text dimColor> thinking…</Text></Text>
+          <Text><Text color="cyan"><Spinner type="dots" /></Text><Text dimColor> ({elapsed}s · thinking)</Text></Text>
         ) : (
           <Text><Text color="cyan" bold>❯ </Text><Text>{input}</Text><Text color="gray">▌</Text></Text>
         )}
