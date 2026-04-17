@@ -219,7 +219,7 @@ function* walkPluginFiles(
 // listing the same string in their `events` array.
 export const BUILTIN_HOOK_EVENTS = [
   "RunStart", "RunEnd", "NodeStart", "NodeEnd",
-  "PreAgent", "PostAgent", "PreProvider", "Paused", "Resumed",
+  "PreAgent", "PostAgent", "PartialAgent", "PreProvider", "Paused", "Resumed",
   "ForkStart", "ForkJoin", "GuardrailFail", "SubworkflowStart", "SubworkflowEnd", "Error",
 ] as const
 
@@ -241,6 +241,7 @@ interface HookEventMap {
   NodeEnd:          { nodeId: string; nodeType: string; to: string | null }
   PreAgent:         { nodeId: string; agent: string; provider: string; userPrompt: string; systemPrompt: string; slicedContext: Context }
   PostAgent:        { nodeId: string; agent: string; provider: string; result: AgentResult; transcriptPath?: string }
+  PartialAgent:     { nodeId: string; agent: string; provider: string; chunk: string; totalChars: number }
   PreProvider:      { nodeId: string; agent: string; provider: string; userPrompt: string; systemPrompt: string; cwd: string; model?: string; logFile: string }
   Paused:           { nodeId: string; reason?: string; stateFile: string }
   Resumed:          { nodeId: string; choice: string }
@@ -362,6 +363,11 @@ function buildSystemPrompt(registry: AgentRegistry, node: GraphNode): string {
 export interface ProviderContext {
   userPrompt: string; systemPrompt: string; options: string[]
   cwd: string; model?: string; logFile: string
+  // Streaming: providers that emit incremental output can call onChunk per chunk.
+  // Core forwards each chunk to PartialAgent hooks; if a hook returns { action: "abort" },
+  // signal is aborted. Providers should check signal.aborted between chunks and throw/return.
+  onChunk?: (chunk: string) => void
+  signal?:  AbortSignal
 }
 export type ProviderInvoke = (ctx: ProviderContext) => Promise<AgentResult>
 
@@ -630,7 +636,7 @@ function abortIfHook(d: HookDirective): void {
 
 async function invokeAgent(
   node: GraphNode, state: RunState,
-  precomputed?: { userPrompt?: string; systemPrompt?: string; model?: string; cwd?: string },
+  precomputed?: { userPrompt?: string; systemPrompt?: string; model?: string; cwd?: string; onChunk?: (c: string) => void; signal?: AbortSignal },
 ): Promise<AgentResult> {
   const def        = state.registry[node.agent!]
   const command    = state.overrides.provider ?? def.command
@@ -643,7 +649,7 @@ async function invokeAgent(
 
   const invoke = await loadProvider(command)
   return Promise.race([
-    invoke({ userPrompt, systemPrompt: sysPrompt, options: Object.keys(node.options ?? {}), cwd, model, logFile }),
+    invoke({ userPrompt, systemPrompt: sysPrompt, options: Object.keys(node.options ?? {}), cwd, model, logFile, onChunk: precomputed?.onChunk, signal: precomputed?.signal }),
     new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`Agent timeout after ${agentTimeout}ms on node "${node.id}"`)), agentTimeout)),
   ])
 }
@@ -684,7 +690,17 @@ async function runAgentPipeline(
     if (typeof preProv.patch.cwd          === "string") cwd        = preProv.patch.cwd
   } else if (await applyDirective(preProv, state, node, fromNodeId)) return { redirected: true }
 
-  const result = await invokeAgent(node, state, { userPrompt, systemPrompt: sysPrompt, model, cwd })
+  const ac = new AbortController()
+  let totalChars = 0
+  const onChunk = (chunk: string) => {
+    totalChars += chunk.length
+    void emitHook("PartialAgent", {
+      nodeId: node.id, agent: node.agent!, provider: command, chunk, totalChars,
+    }, state).then(d => {
+      if (d.action === "abort") ac.abort(new Error(`Aborted by hook: ${d.reason}`))
+    }).catch(() => {})
+  }
+  const result = await invokeAgent(node, state, { userPrompt, systemPrompt: sysPrompt, model, cwd, onChunk, signal: ac.signal })
   const post = await emitHook("PostAgent", {
     nodeId: node.id, agent: node.agent, provider: command, result, transcriptPath: result.transcriptPath,
   }, state)
